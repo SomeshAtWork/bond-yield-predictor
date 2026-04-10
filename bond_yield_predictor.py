@@ -806,8 +806,10 @@ def write_output(preds, bt, macro_w, diag, horizon_label):
         dr += 1
 
     for col in ws.columns:
-        ml = max(len(str(c.value or "")) for c in col)
-        ws.column_dimensions[col[0].column_letter].width = min(ml + 4, 28)
+        cell = col[0]
+        if hasattr(cell, "column_letter"):
+            ml = max(len(str(c.value or "")) for c in col)
+            ws.column_dimensions[cell.column_letter].width = min(ml + 4, 28)
 
     # ========== BACKTEST SHEET ==========
     if BACKTEST_SHEET in wb.sheetnames:
@@ -856,7 +858,9 @@ def write_output(preds, bt, macro_w, diag, horizon_label):
 
     for col in ws2.columns:
         ml = max(len(str(c.value or "")) for c in col)
-        ws2.column_dimensions[col[0].column_letter].width = min(ml + 4, 30)
+        cell = col[0]
+        if hasattr(cell, "column_letter"):
+            ws2.column_dimensions[cell.column_letter].width = min(ml + 4, 30)
 
     wb.save(str(EXCEL_PATH))
     print(f"    Saved: {EXCEL_PATH.name}")
