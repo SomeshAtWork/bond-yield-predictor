@@ -80,6 +80,7 @@ if not LSTM_AVAILABLE:
 # SECTION 2 — CONFIGURATION
 # ============================================================================
 EXCEL_PATH     = Path(r"C:\Users\Lenovo\Downloads\dataforpythontraining.xlsx")
+OUTPUT_PATH    = Path(r"C:\Users\Lenovo\Downloads\bond_predictions_output.xlsx")
 INPUT_SHEET    = "Sheet1"
 OUTPUT_SHEET   = "Predictions"
 BACKTEST_SHEET = "Backtest_Results"
@@ -981,7 +982,11 @@ def analyze_importance(xgb_m, macro_w):
 # ============================================================================
 def write_output(preds, bt, macro_w, diag, horizon_label):
     print(f"\n[12/12] Writing results to Excel ...")
-    wb = openpyxl.load_workbook(str(EXCEL_PATH))
+    # Write to separate output file (input file may be open in Excel)
+    wb = openpyxl.Workbook()
+    # Remove default sheet created by Workbook()
+    if "Sheet" in wb.sheetnames:
+        del wb["Sheet"]
 
     hf  = Font(bold=True, color="FFFFFF", size=11, name="Calibri")
     hfl = PatternFill("solid", fgColor="1F4E79")
@@ -1102,9 +1107,16 @@ def write_output(preds, bt, macro_w, diag, horizon_label):
         ml = max(lengths) if lengths else 8
         ws2.column_dimensions[first.column_letter].width = min(ml + 4, 30)
 
-    wb.save(str(EXCEL_PATH))
-    print(f"    Saved: {EXCEL_PATH.name}")
-    print(f"    New sheets: '{OUTPUT_SHEET}', '{BACKTEST_SHEET}'")
+    # Save to dedicated output file (never overwrites input)
+    save_path = OUTPUT_PATH
+    try:
+        wb.save(str(save_path))
+    except PermissionError:
+        # Fallback: save to Desktop if output file is also locked
+        save_path = Path.home() / "Desktop" / "bond_predictions_output.xlsx"
+        wb.save(str(save_path))
+    print(f"    Saved: {save_path}")
+    print(f"    Sheets: '{OUTPUT_SHEET}', '{BACKTEST_SHEET}'")
 
 
 # ============================================================================
@@ -1176,7 +1188,7 @@ def main():
                   f"{p['predicted_pct']:>9.3f}% {p['confidence']:>5.1f}% "
                   f"{p['momentum']:>8s}")
 
-    print(f"\n  Results written to:  {EXCEL_PATH.name}")
+    print(f"\n  Results written to:  {OUTPUT_PATH}")
     print(f"  Sheets: '{OUTPUT_SHEET}'  and  '{BACKTEST_SHEET}'")
     print("=" * 82)
 
