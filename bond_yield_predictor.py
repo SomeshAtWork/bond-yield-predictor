@@ -1,6 +1,6 @@
 """
 ================================================================================
-  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.1
+  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.2
 ================================================================================
   Multi-Model Ensemble:
     Econometric  —  VAR / VECM  (reduced-form, max 4 vars, lag-capped)
@@ -8,19 +8,17 @@
     ML           —  XGBoost (regressor-only, no classifier mismatch)
     Deep Learn   —  Bidirectional LSTM  (scaler fitted on TRAIN only)
 
-  v3.1 fixes vs v3.0:
-    - NSS cache: date-based invalidation (not row-count)
-    - NSS lambda: multi-day representative selection (not single median)
-    - VECM Johansen test aligned to same 4 variables used by VAR
-    - XGBoost early_stopping_rounds=50 (halves training time)
-    - Macro weight scaling: linear (not sqrt; range 0.7x–1.8x for LSTM)
-    - Macro pct_change clipped to [-5, 5] (IIP near-zero explosion)
-    - VAR/HW ensemble RMSE computed from in-sample residuals (not hardcoded)
-    - LSTM features selected by priority category (not column order)
-    - Empirical CI centered on model prediction (not raw historical)
-    - Granger causality maxlag reduced 5 -> 3
-    - Excel column width: max() default guards empty columns
-    - Unit safety assertions on load (catches data format changes)
+  v3.2 fixes vs v3.1:
+    - Direction always = sign(ensemble_magnitude), never a vote
+    - FLAT threshold scales with horizon: 1bps/3bps/8bps for 1W/1M/3M
+    - VECM coint_rank from Johansen trace test (not hardcoded 1)
+    - Macro z-score: diff() for rate vars (CPI/Repo/IIP), pct_change() for
+      levels (NSE/FII/Crude/USD_INR) — economically correct
+    - Hull-White attenuation for 6M/1Y from historical 3M correlation
+    - NSS cache version-tagged: auto-invalidates on method change
+    - LOW CONFIDENCE flag when dir_acc < 55% (near coin-flip)
+    - Backtest output labelled XGBoost-only (not mislabelled as ensemble)
+    - Removed dead code: nss_yield(), sys, sm, accuracy_score
 
   Data leakage: ZERO. Verified by gap + train-only scaling.
 ================================================================================
@@ -29,7 +27,7 @@
 # ============================================================================
 # SECTION 1 — IMPORTS
 # ============================================================================
-import os, sys, warnings, datetime as dt
+import os, warnings, datetime as dt
 from pathlib import Path
 
 import numpy  as np
@@ -39,9 +37,8 @@ from scipy.optimize import minimize as sp_minimize
 
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-import statsmodels.api as sm
 from statsmodels.tsa.api import VAR
 from statsmodels.tsa.stattools import adfuller, grangercausalitytests
 from statsmodels.tsa.vector_ar.vecm import coint_johansen, VECM
@@ -68,7 +65,7 @@ except ImportError:
     pass
 
 print("=" * 72)
-print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.1")
+print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.2")
 models_str = "VAR/VECM + NSS + Hull-White + XGBoost"
 if LSTM_AVAILABLE:
     models_str += " + Bi-LSTM"
@@ -182,34 +179,26 @@ def get_macro_weights():
 # ============================================================================
 # SECTION 5 — NELSON-SIEGEL-SVENSSON DAILY FITTER
 # ============================================================================
-def nss_yield(tau, b0, b1, b2, b3, l1, l2):
-    """NSS model: yield as function of maturity tau and 6 params."""
-    tau = np.maximum(tau, 1e-6)
-    e1  = np.exp(-tau / l1)
-    e2  = np.exp(-tau / l2)
-    t1  = (1 - e1) / (tau / l1)
-    t2  = t1 - e1
-    t3  = (1 - e2) / (tau / l2) - e2
-    return b0 + b1 * t1 + b2 * t2 + b3 * t3
-
-
 def fit_nss_fast(df):
     """Fit NSS to each day using fixed-lambda OLS + grid search.
     Returns DataFrame with [nss_b0, nss_b1, nss_b2, nss_b3] per day.
     """
     print("\n[2/12] Fitting Nelson-Siegel-Svensson (daily) ...")
 
-    # Check cache (date-based: refit if data is >3 days newer than cache)
+    # Cache version tag — bump when fitting method changes to force refit
+    NSS_VERSION = "v3.2-multiday"
     if NSS_CACHE.exists():
         cached = pd.read_csv(NSS_CACHE, index_col=0, parse_dates=True)
+        cache_ver = cached.columns[-1] if cached.columns[-1].startswith("ver") else ""
         last_cache = cached.index.max()
         last_data  = df.index.max()
-        if (last_data - last_cache).days <= 3:
+        if cache_ver == NSS_VERSION and (last_data - last_cache).days <= 3:
+            data_cols = [c for c in cached.columns if not c.startswith("ver")]
             print(f"    Loaded from cache ({len(cached)} rows, "
                   f"through {last_cache:%Y-%m-%d})")
-            return cached.reindex(df.index).ffill().bfill()
-        print(f"    Cache stale ({last_cache:%Y-%m-%d} vs "
-              f"{last_data:%Y-%m-%d}), refitting ...")
+            return cached[data_cols].reindex(df.index).ffill().bfill()
+        reason = "version change" if cache_ver != NSS_VERSION else "stale data"
+        print(f"    Cache invalid ({reason}), refitting ...")
 
     taus = np.array(list(MATURITIES_YRS.values()))
     yields_mat = df[list(YIELD_COLS.values())].values  # (T, 22)
@@ -259,9 +248,11 @@ def fit_nss_fast(df):
         betas_all, index=df.index,
         columns=["nss_b0", "nss_b1", "nss_b2", "nss_b3"]
     )
+    result["ver_tag"] = NSS_VERSION   # version tag for cache invalidation
 
     # Cache
     result.to_csv(NSS_CACHE)
+    result = result.drop(columns=["ver_tag"])
     print(f"    Fitted {len(result)} days  |  lambda1={best_l1}, lambda2={best_l2}")
     print(f"    Cached to {NSS_CACHE.name}")
     return result
@@ -322,10 +313,16 @@ def engineer_features(df, macro_weights, nss_params):
         F[f"m_ma60_{name}"]  = df[col].rolling(60).mean() * w_scale
         F[f"m_std20_{name}"] = df[col].rolling(20).std()
 
-    # weighted macro composite z-score
+    # Weighted macro composite z-score
+    # Rate variables (CPI, Repo, IIP): use diff() — change in the rate is the signal
+    # Level variables (NSE, FII, Crude, USD/INR): use pct_change() — % change
+    RATE_VARS = {"CPI", "Repo Rate", "IIP"}
     z_parts = pd.DataFrame(index=df.index)
     for name, col in MACRO_COLS.items():
-        chg = df[col].pct_change(20)
+        if name in RATE_VARS:
+            chg = df[col].diff(20)                           # absolute change in rate
+        else:
+            chg = df[col].pct_change(20).clip(-5, 5)        # % change, clipped
         mu  = chg.rolling(252, min_periods=60).mean()
         sig = chg.rolling(252, min_periods=60).std()
         z_parts[name] = ((chg - mu) / (sig + 1e-12)).clip(-4, 4)
@@ -392,6 +389,7 @@ def run_diagnostics(df):
     # Johansen on same 4 vars used by VAR/VECM (5Y, 10Y, CPI, Repo)
     print("\n  Johansen Cointegration (5Y + 10Y + CPI + Repo):")
     diag["cointegrated"] = False
+    diag["coint_rank"]   = 0
     try:
         coint_cols = [YIELD_COLS["5Y"], YIELD_COLS["10Y"],
                       MACRO_COLS["CPI"], MACRO_COLS["Repo Rate"]]
@@ -400,11 +398,17 @@ def run_diagnostics(df):
             joh = coint_johansen(monthly, det_order=0, k_ar_diff=2)
             print(f"  {'Hypothesis':18s} {'Trace':>9s} {'Crit-95%':>9s} {'Coint?':>8s}")
             print("  " + "-" * 48)
-            for i in range(min(3, len(joh.lr1))):
+            rank = 0
+            for i in range(min(len(coint_cols), len(joh.lr1))):
                 tr, cv = joh.lr1[i], joh.cvt[i, 1]
+                is_c = tr > cv
                 print(f"  r <= {i}              {tr:9.3f} {cv:9.3f} "
-                      f"{'YES' if tr > cv else 'no':>8s}")
-            diag["cointegrated"] = bool(joh.lr1[0] > joh.cvt[0, 1])
+                      f"{'YES' if is_c else 'no':>8s}")
+                if is_c:
+                    rank = i + 1
+            diag["cointegrated"] = rank > 0
+            diag["coint_rank"]   = rank
+            print(f"  => Cointegrating rank = {rank}")
     except Exception as e:
         print(f"  (skipped: {e})")
 
@@ -450,16 +454,16 @@ def fit_hull_white(df, horizon_days):
         return 0.5 * np.sum(resid**2 / var + np.log(var))
 
     theta_init = float(df[MACRO_COLS["Repo Rate"]].iloc[-1])
-    # Bounds: theta range covers any plausible decimal rate (0.1%–20%)
+    # Bounds: theta covers any plausible Indian decimal rate (0.1%–20%)
     res = sp_minimize(neg_ll, [2.0, theta_init, 0.005],
                       method="L-BFGS-B",
                       bounds=[(0.01, 20), (0.001, 0.20), (0.0001, 0.05)])
     kappa, theta, sigma = res.x
 
-    # In-sample RMSE for ensemble weighting (not hardcoded)
-    r = short_yield.values
-    r_pred = r[:-1] + kappa * (theta - r[:-1]) * DT
-    hw_rmse = float(np.sqrt(np.mean((r[1:] - r_pred)**2)) * 10_000)
+    # In-sample RMSE for ensemble weighting
+    rv = short_yield.values
+    r_pred_is = rv[:-1] + kappa * (theta - rv[:-1]) * DT
+    hw_rmse = float(np.sqrt(np.mean((rv[1:] - r_pred_is)**2)) * 10_000)
 
     r_now = float(short_yield.iloc[-1])
     h     = horizon_days * DT
@@ -467,13 +471,29 @@ def fit_hull_white(df, horizon_days):
     chg   = (r_fc - r_now) * 10_000
     ci_v  = sigma * np.sqrt((1 - np.exp(-2*kappa*h)) / (2*kappa)) * 10_000
 
+    # Compute data-driven attenuation for 6M/1Y from historical correlations
+    d3m = df[YIELD_COLS["3M"]].diff().dropna()
+    att = {}
+    for lab in ["6M", "1Y"]:
+        d_tgt = df[YIELD_COLS[lab]].diff().dropna()
+        idx   = d3m.index.intersection(d_tgt.index)
+        if len(idx) > 200:
+            # beta from OLS regression: d_target = beta * d_3M
+            b = float(np.cov(d_tgt.loc[idx], d3m.loc[idx])[0, 1]
+                      / (np.var(d3m.loc[idx]) + 1e-12))
+            att[lab] = float(np.clip(b, 0.5, 1.0))
+        else:
+            att[lab] = 0.85 if lab == "6M" else 0.70   # fallback
+
     print(f"    kappa={kappa:.3f}  theta={theta:.4f}  sigma={sigma:.5f}")
     print(f"    In-sample RMSE: {hw_rmse:.2f} bps")
+    print(f"    Term attenuation:  6M={att['6M']:.3f}  1Y={att['1Y']:.3f}")
     print(f"    3M forecast: {r_fc:.4f}  (change: {chg:+.1f} bps, "
           f"90%CI: [{chg - 1.65*ci_v:+.1f}, {chg + 1.65*ci_v:+.1f}])")
 
     return {"kappa": kappa, "theta": theta, "sigma": sigma,
             "r_forecast": r_fc, "change_bps": chg, "rmse": hw_rmse,
+            "attenuation": att,
             "ci_lo": chg - 1.65 * ci_v, "ci_hi": chg + 1.65 * ci_v}
 
 
@@ -522,8 +542,9 @@ def build_econometric(df, diag, horizon_days):
         if diag.get("cointegrated"):
             try:
                 ml = monthly[monthly.index >= cutoff].dropna()
+                cr = max(1, diag.get("coint_rank", 1))  # from Johansen, not hardcoded
                 vecm_res = VECM(ml, k_ar_diff=max(lag - 1, 1),
-                                coint_rank=1).fit()
+                                coint_rank=cr).fit()
                 vecm_levels = vecm_res.predict(steps=steps)
                 last_level = monthly.iloc[-1].values
                 vecm_fcast = vecm_levels[-1] - last_level   # change from last
@@ -718,6 +739,8 @@ def build_lstm(features, df, horizon, seq_len=60):
 # ============================================================================
 def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
     print(f"\n[9/12] Generating ensemble predictions ...")
+    # Horizon-dependent FLAT threshold (bps): tighter for short horizons
+    FLAT_BPS = {5: 1, 20: 3, 60: 8}.get(horizon, 3)
     predictions = {}
     has_lstm = lstm_m is not None
     has_var  = econ is not None
@@ -768,10 +791,9 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
         # --- Hull-White (short end only) ---
         if hw and lab in ["3M", "6M", "1Y"]:
             hw_mag = hw["change_bps"]
-            if lab == "6M":
-                hw_mag *= 0.85
-            elif lab == "1Y":
-                hw_mag *= 0.70
+            if lab != "3M":
+                # Use data-driven attenuation (not hardcoded 0.85/0.70)
+                hw_mag *= hw.get("attenuation", {}).get(lab, 0.75)
             sources.append({"src": "HullWhite", "mag": hw_mag,
                             "dir": "UP" if hw_mag > 0 else "DOWN",
                             "conf": 0.60,
@@ -786,13 +808,18 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
         for i, s in enumerate(sources):
             s["w"] = float(weights[i])
 
-        tw   = sum(s["w"] for s in sources)
-        emag = sum(s["mag"] * s["w"] for s in sources) / tw
+        tw    = sum(s["w"] for s in sources)
+        emag  = sum(s["mag"] * s["w"] for s in sources) / tw
         econf = sum(s["conf"] * s["w"] for s in sources) / tw
 
-        up_w = sum(s["w"] for s in sources if s["dir"] == "UP")
-        dn_w = sum(s["w"] for s in sources if s["dir"] == "DOWN")
-        edir = "FLAT" if abs(emag) < 2 else ("UP" if up_w > dn_w else "DOWN")
+        # Direction ALWAYS from sign(ensemble_magnitude) — never from a vote.
+        # A vote can contradict magnitude (e.g. "DOWN +6.3 bps") which is nonsense.
+        if abs(emag) < FLAT_BPS:
+            edir = "FLAT"
+        elif emag > 0:
+            edir = "UP"
+        else:
+            edir = "DOWN"
 
         # Empirical quantile CI, centered on model prediction (not historical median)
         hist = (df[col].diff(horizon) * 10_000).dropna().tail(504)
@@ -825,14 +852,18 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
         else:
             momentum = "N/A"
 
+        conf_pct = round(min(econf * 100, 95), 1)
+        # LOW CONFIDENCE: model near coin-flip — don't trust direction
+        low_conf = conf_pct < 55.0
+
         predictions[lab] = {
             "current_pct":   round(current, 4),
-            "direction":     edir,
+            "direction":     "LOW CONF" if low_conf else edir,
             "change_bps":    round(emag, 2),
             "range_lo_bps":  round(lo, 2),
             "range_hi_bps":  round(hi, 2),
             "predicted_pct": round(current + emag / 100, 4),
-            "confidence":    round(min(econf * 100, 95), 1),
+            "confidence":    conf_pct,
             "momentum":      momentum,
             "n_models":      len(sources),
             "models":        "+".join(s["src"] for s in sources),
@@ -845,6 +876,7 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
 # ============================================================================
 def run_backtest(features, df, macro_w, horizon, n_folds=5):
     print(f"\n[10/12] Walk-forward backtest  ({n_folds} folds, {horizon}d horizon) ...")
+    print(f"        [XGBoost-only component — ensemble accuracy may differ]")
     results = {}
     key_mats = ["3M","1Y","2Y","5Y","7Y","10Y","14Y","30Y"]
     tscv = TimeSeriesSplit(n_splits=n_folds, test_size=252)
@@ -999,9 +1031,12 @@ def write_output(preds, bt, macro_w, diag, horizon_label):
         for ci, v in enumerate(vals, 1):
             c = ws.cell(dr, ci, v); c.border = bdr; c.alignment = ctr
             if ci == 3:
-                if v == "UP":    c.fill = upf; c.font = Font(bold=True, color="006100")
-                elif v == "DOWN":c.fill = dnf; c.font = Font(bold=True, color="9C0006")
-                else:            c.fill = ftf; c.font = Font(bold=True, color="9C6500")
+                if v == "UP":       c.fill = upf; c.font = Font(bold=True, color="006100")
+                elif v == "DOWN":   c.fill = dnf; c.font = Font(bold=True, color="9C0006")
+                elif v == "LOW CONF":
+                    c.fill = PatternFill("solid", fgColor="D9D9D9")
+                    c.font = Font(bold=True, color="595959")
+                else:               c.fill = ftf; c.font = Font(bold=True, color="9C6500")
         dr += 1
 
     # Safe column width (skip MergedCell objects + guard empty columns)
@@ -1028,10 +1063,10 @@ def write_output(preds, bt, macro_w, diag, horizon_label):
         c = ws2.cell(3, ci, h); c.font = hf; c.fill = hfl; c.border = bdr
 
     br = 4
-    for lab, r in bt.items():
-        vals = [lab, f"{r['dir_acc']:.1%}", f"{r['dir_std']:.1%}",
-                f"{r['rmse']:.2f}", f"{r['mae']:.2f}",
-                f"{r['naive_acc']:.1%}", f"{r['edge']:+.1%}"]
+    for lab, btr in bt.items():
+        vals = [lab, f"{btr['dir_acc']:.1%}", f"{btr['dir_std']:.1%}",
+                f"{btr['rmse']:.2f}", f"{btr['mae']:.2f}",
+                f"{btr['naive_acc']:.1%}", f"{btr['edge']:+.1%}"]
         for ci, v in enumerate(vals, 1):
             c = ws2.cell(br, ci, v); c.border = bdr
         br += 1
@@ -1126,7 +1161,7 @@ def main():
 
     # ===== FINAL SUMMARY =====
     print("\n" + "=" * 82)
-    print("  PREDICTION SUMMARY  (v3.0)")
+    print("  PREDICTION SUMMARY  (v3.2)")
     print("=" * 82)
     print(f"  Horizon: {hlabel} ({hdays} trading days)\n")
     print(f"  {'Mat':>6s} {'Current':>8s} {'Dir':>7s} {'Chg(bps)':>9s} "
