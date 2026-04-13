@@ -1,6 +1,6 @@
 """
 ================================================================================
-  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.3
+  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.4
 ================================================================================
   Multi-Model Ensemble:
     Econometric  —  VAR / VECM  (reduced-form, max 4 vars, lag-capped)
@@ -21,6 +21,15 @@
     7. LOW CONFIDENCE threshold from binomial test (not hardcoded 55%)
     8. Granger causality uses diff() for rate vars (consistent with z-score)
     9. XGBoost stores n_test for statistical confidence computation
+
+  v3.4 fixes vs v3.3  (7 production-readiness fixes):
+    1. LSTM gated in ensemble: excluded if dir_acc <= 0.50 (anticorrelated)
+    2. Momentum baseline added to backtest (fairer than naive majority-class)
+    3. DirAcc > 80% flagged as possible regime artifact
+    4. Macro weight vs model importance divergence surfaced (Spearman rho)
+    5. Hull-White CI width > 80 bps flagged as unreliable
+    6. Negative edge warning when model underperforms baselines
+    7. Backtest edge computed vs max(naive, momentum) — harder benchmark
 
   Data leakage: ZERO. Verified by gap + train-only scaling.
 ================================================================================
@@ -67,7 +76,7 @@ except ImportError:
     pass
 
 print("=" * 72)
-print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.3")
+print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.4")
 models_str = "VAR/VECM + NSS + Hull-White + XGBoost"
 if LSTM_AVAILABLE:
     models_str += " + Bi-LSTM"
@@ -538,8 +547,12 @@ def fit_hull_white(df, horizon_days):
     print(f"    kappa={kappa:.3f}  theta={theta:.4f}  sigma={sigma:.5f}")
     print(f"    In-sample RMSE: {hw_rmse:.2f} bps")
     print(f"    Term attenuation:  6M={att['6M']:.3f}  1Y={att['1Y']:.3f}")
+    ci_width = 2 * 1.65 * ci_v
     print(f"    3M forecast: {r_fc:.4f}  (change: {chg:+.1f} bps, "
           f"90%CI: [{chg - 1.65*ci_v:+.1f}, {chg + 1.65*ci_v:+.1f}])")
+    if ci_width > 80:
+        print(f"    [!] CI width ({ci_width:.0f} bps) is very wide — "
+              f"short-rate prediction unreliable at this horizon")
 
     return {"kappa": kappa, "theta": theta, "sigma": sigma,
             "r_forecast": r_fc, "change_bps": chg, "rmse": hw_rmse,
@@ -687,7 +700,9 @@ def build_xgboost(features, df, macro_weights, horizon):
     for m in DISPLAY_MATS:
         if m in models:
             r = models[m]
-            print(f"  {m:>6s} {r['dir_acc']:>6.1%} {r['rmse']:>8.2f} {r['mae']:>8.2f}")
+            flag = "  [!] regime artifact?" if r["dir_acc"] > 0.80 else ""
+            print(f"  {m:>6s} {r['dir_acc']:>6.1%} {r['rmse']:>8.2f} "
+                  f"{r['mae']:>8.2f}{flag}")
     return models
 
 
@@ -834,8 +849,8 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
                             "dir": "UP" if mag > 0 else "DOWN",
                             "conf": conf, "rmse": xgb_m[lab]["rmse"]})
 
-        # --- LSTM ---
-        if has_lstm and lab in lstm_m:
+        # --- LSTM (gated: exclude if dir_acc <= 0.50 — anticorrelated) ---
+        if has_lstm and lab in lstm_m and lstm_m[lab]["dir_acc"] > 0.50:
             m   = lstm_m[lab]
             raw = features[m["feats"]].iloc[-m["seq"]:].values
             xs  = m["sx"].transform(raw).reshape(1, m["seq"], -1)
@@ -969,7 +984,9 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
         if len(X) < 2000:
             continue
 
-        daccs, rmses, maes, naive_accs = [], [], [], []
+        daccs, rmses, maes, naive_accs, mom_accs = [], [], [], [], []
+        # Precompute past realized changes for momentum baseline
+        past_chg = (df[col].diff(horizon) * 10_000).reindex(X.index)
 
         for train_i, test_i in tscv.split(X):
             # gap between train and test
@@ -990,30 +1007,49 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
             rmses.append(np.sqrt(mean_squared_error(yte, pred)))
             maes.append(mean_absolute_error(yte, pred))
 
-            # FIX: naive benchmark = majority class accuracy
+            # Naive benchmark = majority class accuracy
             prop_up  = float(np.mean(yte > 0))
             naive_accs.append(max(prop_up, 1 - prop_up))
 
+            # Momentum benchmark: predict same direction as past horizon-day change
+            mom_signs = np.sign(past_chg.iloc[test_i].values)
+            valid_mom = np.isfinite(mom_signs)
+            if valid_mom.sum() > 0:
+                mom_accs.append(float(np.mean(
+                    np.sign(yte.values[valid_mom]) == mom_signs[valid_mom])))
+
         if daccs:
+            navg = np.mean(naive_accs)
+            mavg = np.mean(mom_accs) if mom_accs else navg
+            best_base = max(navg, mavg)
             results[lab] = {
                 "dir_acc":   np.mean(daccs),
                 "dir_std":   np.std(daccs),
                 "rmse":      np.mean(rmses),
                 "mae":       np.mean(maes),
-                "naive_acc": np.mean(naive_accs),
-                "edge":      np.mean(daccs) - np.mean(naive_accs),
+                "naive_acc": navg,
+                "mom_acc":   mavg,
+                "edge":      np.mean(daccs) - best_base,
                 "folds":     len(daccs),
             }
 
     print(f"\n  {'Mat':>6s} {'DirAcc':>7s} {'+-Std':>6s} {'RMSE':>8s} "
-          f"{'MAE':>8s} {'Naive':>6s} {'Edge':>7s}")
-    print("  " + "-" * 52)
+          f"{'MAE':>8s} {'Naive':>6s} {'Mom':>6s} {'Edge':>7s}")
+    print("  " + "-" * 60)
     for m in key_mats:
         if m in results:
             r = results[m]
             print(f"  {m:>6s} {r['dir_acc']:>6.1%} {r['dir_std']:>5.1%} "
                   f"{r['rmse']:>8.2f} {r['mae']:>8.2f} "
-                  f"{r['naive_acc']:>5.1%} {r['edge']:>+6.1%}")
+                  f"{r['naive_acc']:>5.1%} {r['mom_acc']:>5.1%} "
+                  f"{r['edge']:>+6.1%}")
+
+    # Warning: systematic underperformance vs baselines
+    neg_count = sum(1 for r in results.values() if r["edge"] < 0)
+    if neg_count > len(results) // 2:
+        print(f"\n  [WARNING] {neg_count}/{len(results)} maturities have negative "
+              f"edge vs best baseline.")
+        print(f"  Model may underperform simple benchmarks in current regime.")
     return results
 
 
@@ -1047,6 +1083,18 @@ def analyze_importance(xgb_m, macro_w):
     for name in MACRO_COLS:
         pct = macro_imp[name] / ti * 100
         print(f"  {name:15s} {pct:>8.1f}% {macro_w[name]:>7.1f}%")
+
+    # Check divergence between user weights and model importance
+    model_vals = [macro_imp.get(name, 0) for name in MACRO_COLS]
+    user_vals  = [macro_w.get(name, 0) for name in MACRO_COLS]
+    if len(model_vals) >= 3:
+        rho, _ = stats.spearmanr(model_vals, user_vals)
+        if rho < 0.4:
+            print(f"\n  [WARNING] Model macro drivers diverge from user weights "
+                  f"(Spearman rho={rho:.2f})")
+            print(f"  XGBoost splits on information gain, not feature scaling.")
+            print(f"  User weights affect macro_composite z-score and LSTM, "
+                  f"not tree splits.")
     return macro_imp
 
 
@@ -1136,7 +1184,7 @@ def write_output(preds, bt, macro_w, diag, horizon_label):
     ws2["A1"].font = Font(bold=True, size=14, color="1F4E79")
 
     bh = ["Maturity","Dir Accuracy","Std","RMSE (bps)","MAE (bps)",
-          "Naive Acc","Edge vs Naive"]
+          "Naive Acc","Mom Acc","Edge vs Best"]
     for ci, h in enumerate(bh, 1):
         c = ws2.cell(3, ci, h); c.font = hf; c.fill = hfl; c.border = bdr
 
@@ -1144,7 +1192,8 @@ def write_output(preds, bt, macro_w, diag, horizon_label):
     for lab, btr in bt.items():
         vals = [lab, f"{btr['dir_acc']:.1%}", f"{btr['dir_std']:.1%}",
                 f"{btr['rmse']:.2f}", f"{btr['mae']:.2f}",
-                f"{btr['naive_acc']:.1%}", f"{btr['edge']:+.1%}"]
+                f"{btr['naive_acc']:.1%}",
+                f"{btr.get('mom_acc', 0):.1%}", f"{btr['edge']:+.1%}"]
         for ci, v in enumerate(vals, 1):
             c = ws2.cell(br, ci, v); c.border = bdr
         br += 1
@@ -1257,7 +1306,7 @@ def main():
 
     # ===== FINAL SUMMARY =====
     print("\n" + "=" * 82)
-    print("  PREDICTION SUMMARY  (v3.3)")
+    print("  PREDICTION SUMMARY  (v3.4)")
     print("=" * 82)
     print(f"  Horizon: {hlabel} ({hdays} trading days)\n")
     print(f"  {'Mat':>6s} {'Current':>8s} {'Dir':>7s} {'Chg(bps)':>9s} "
