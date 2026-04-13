@@ -1,6 +1,6 @@
 """
 ================================================================================
-  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.2
+  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.3
 ================================================================================
   Multi-Model Ensemble:
     Econometric  —  VAR / VECM  (reduced-form, max 4 vars, lag-capped)
@@ -8,17 +8,19 @@
     ML           —  XGBoost (regressor-only, no classifier mismatch)
     Deep Learn   —  Bidirectional LSTM  (scaler fitted on TRAIN only)
 
-  v3.2 fixes vs v3.1:
-    - Direction always = sign(ensemble_magnitude), never a vote
-    - FLAT threshold scales with horizon: 1bps/3bps/8bps for 1W/1M/3M
-    - VECM coint_rank from Johansen trace test (not hardcoded 1)
-    - Macro z-score: diff() for rate vars (CPI/Repo/IIP), pct_change() for
-      levels (NSE/FII/Crude/USD_INR) — economically correct
-    - Hull-White attenuation for 6M/1Y from historical 3M correlation
-    - NSS cache version-tagged: auto-invalidates on method change
-    - LOW CONFIDENCE flag when dir_acc < 55% (near coin-flip)
-    - Backtest output labelled XGBoost-only (not mislabelled as ensemble)
-    - Removed dead code: nss_yield(), sys, sm, accuracy_score
+  v3.3 fixes vs v3.2  (9 engineering fixes):
+    1. DATA_START_YEAR removed — auto-detect; sparse maturities (40Y/50Y)
+       excluded by MIN_MAT_OBS real-observation filter
+    2. Johansen cointegration moved INSIDE build_econometric() so
+       k_ar_diff matches VAR-selected lag (was hardcoded 2 in diagnostics)
+    3. Hull-White multi-start (5 seeds) to escape local minima
+    4. _make_xgb() factory enforces identical hyperparams across
+       build_xgboost() and run_backtest()
+    5. LSTM seq_len derived from ACF decay (not hardcoded 60)
+    6. FLAT threshold per-maturity from 20th percentile of |historical Δ|
+    7. LOW CONFIDENCE threshold from binomial test (not hardcoded 55%)
+    8. Granger causality uses diff() for rate vars (consistent with z-score)
+    9. XGBoost stores n_test for statistical confidence computation
 
   Data leakage: ZERO. Verified by gap + train-only scaling.
 ================================================================================
@@ -40,7 +42,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 from statsmodels.tsa.api import VAR
-from statsmodels.tsa.stattools import adfuller, grangercausalitytests
+from statsmodels.tsa.stattools import adfuller, grangercausalitytests, acf
 from statsmodels.tsa.vector_ar.vecm import coint_johansen, VECM
 
 import xgboost as xgb
@@ -65,7 +67,7 @@ except ImportError:
     pass
 
 print("=" * 72)
-print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.2")
+print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.3")
 models_str = "VAR/VECM + NSS + Hull-White + XGBoost"
 if LSTM_AVAILABLE:
     models_str += " + Bi-LSTM"
@@ -86,7 +88,7 @@ OUTPUT_SHEET   = "Predictions"
 BACKTEST_SHEET = "Backtest_Results"
 NSS_CACHE      = Path(r"C:\Users\Lenovo\Downloads\nss_params_cache.csv")
 
-DATA_START_YEAR = 2000
+MIN_MAT_OBS = 500   # minimum real (pre-interpolation) observations per maturity
 
 YIELD_COLS = {
     "3M":"IN3MT Yield (%)","6M":"IN6MT Yield (%)",
@@ -134,9 +136,13 @@ def load_data():
     df.sort_values("Date", inplace=True)
     df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
     df.set_index("Date", inplace=True)
-    df = df[df.index.year >= DATA_START_YEAR]
     for col in MACRO_COLS.values():
         df[col] = df[col].ffill()
+    # Count real (non-NaN) observations per maturity BEFORE interpolation
+    # Used downstream to exclude sparse maturities (e.g. 40Y/50Y)
+    mat_real_obs = {}
+    for lab, col in YIELD_COLS.items():
+        mat_real_obs[lab] = int(df[col].notna().sum())
     for col in YIELD_COLS.values():
         df[col] = df[col].interpolate(method="linear")
     # Unit safety: all rates must be decimal (0.065 = 6.5%), not percent
@@ -149,7 +155,7 @@ def load_data():
     df.dropna(inplace=True)
     print(f"    Rows: {len(df):,}  |  "
           f"Range: {df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d}")
-    return df
+    return df, mat_real_obs
 
 
 # ============================================================================
@@ -175,6 +181,49 @@ def get_macro_weights():
     for k, v in weights.items():
         print(f"    {k:12s}  {v:5.1f}%  {'|' * int(v / 2)}")
     return weights
+
+
+# ============================================================================
+# SECTION 4b — HELPER FUNCTIONS  (factory, ACF seq_len, FLAT threshold)
+# ============================================================================
+def _make_xgb(n_estimators=500, max_depth=6, early_stopping_rounds=50):
+    """Factory for XGBoost regressors — shared hyperparameters enforced.
+    build_xgboost() uses defaults; run_backtest() passes smaller values
+    explicitly (fewer trees for smaller per-fold training sets).
+    """
+    return xgb.XGBRegressor(
+        n_estimators=n_estimators, max_depth=max_depth, learning_rate=0.01,
+        subsample=0.8, colsample_bytree=0.7, min_child_weight=5,
+        reg_alpha=0.1, reg_lambda=1.0, eval_metric="rmse",
+        early_stopping_rounds=early_stopping_rounds,
+        random_state=42, verbosity=0)
+
+
+def _compute_seq_len(series, max_lag=120, min_lag=20, default=60):
+    """ACF-based LSTM sequence length: first lag where |ACF| < 0.05.
+    Falls back to `default` if series is too short or ACF never decays.
+    """
+    try:
+        s = series.diff().dropna().values
+        if len(s) < max_lag * 2:
+            return default
+        a = acf(s, nlags=max_lag, fft=True)
+        for i in range(min_lag, len(a)):
+            if abs(a[i]) < 0.05:
+                return i
+        return default
+    except Exception:
+        return default
+
+
+def _compute_flat_bps(df, col, horizon, fallback=3.0):
+    """Per-maturity FLAT threshold: 20th percentile of |historical changes|.
+    Returns at least 0.5 bps to avoid marking everything as FLAT.
+    """
+    hist = (df[col].diff(horizon) * 10_000).dropna().tail(504)
+    if len(hist) > 60:
+        return max(0.5, float(np.percentile(np.abs(hist), 20)))
+    return fallback
 
 
 # ============================================================================
@@ -387,38 +436,20 @@ def run_diagnostics(df):
         print(f"  {name:15s} {pr:9.4f} {sr:9.4f} {rtype:>14s}")
     diag["linearity"] = linearity
 
-    # Johansen on same 4 vars used by VAR/VECM (5Y, 10Y, CPI, Repo)
-    print("\n  Johansen Cointegration (5Y + 10Y + CPI + Repo):")
-    diag["cointegrated"] = False
-    diag["coint_rank"]   = 0
-    try:
-        coint_cols = [YIELD_COLS["5Y"], YIELD_COLS["10Y"],
-                      MACRO_COLS["CPI"], MACRO_COLS["Repo Rate"]]
-        monthly = df[coint_cols].resample("ME").last().dropna()
-        if len(monthly) > 60:
-            joh = coint_johansen(monthly, det_order=0, k_ar_diff=2)
-            print(f"  {'Hypothesis':18s} {'Trace':>9s} {'Crit-95%':>9s} {'Coint?':>8s}")
-            print("  " + "-" * 48)
-            rank = 0
-            for i in range(min(len(coint_cols), len(joh.lr1))):
-                tr, cv = joh.lr1[i], joh.cvt[i, 1]
-                is_c = tr > cv
-                print(f"  r <= {i}              {tr:9.3f} {cv:9.3f} "
-                      f"{'YES' if is_c else 'no':>8s}")
-                if is_c:
-                    rank = i + 1
-            diag["cointegrated"] = rank > 0
-            diag["coint_rank"]   = rank
-            print(f"  => Cointegrating rank = {rank}")
-    except Exception as e:
-        print(f"  (skipped: {e})")
+    # NOTE: Johansen cointegration now runs inside build_econometric()
+    # so that k_ar_diff matches the VAR-selected lag (not hardcoded 2).
 
     print(f"\n  Granger Causality  (Macro -> d(10Y),  max lag 3):")
+    RATE_VARS = {"CPI", "Repo Rate", "IIP"}
     gc = {}
     ychg = df[YIELD_COLS["10Y"]].diff().dropna()
     for name, col in MACRO_COLS.items():
         try:
-            xchg = df[col].pct_change().dropna()
+            # Rate vars: diff() (absolute change); level vars: pct_change()
+            if name in RATE_VARS:
+                xchg = df[col].diff().dropna()
+            else:
+                xchg = df[col].pct_change().dropna()
             idx  = ychg.index.intersection(xchg.index)
             tmp  = pd.DataFrame({"y": ychg.loc[idx], "x": xchg.loc[idx]})
             tmp.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -455,11 +486,29 @@ def fit_hull_white(df, horizon_days):
         return 0.5 * np.sum(resid**2 / var + np.log(var))
 
     theta_init = float(df[MACRO_COLS["Repo Rate"]].iloc[-1])
-    # Bounds: theta covers any plausible Indian decimal rate (0.1%–20%)
-    res = sp_minimize(neg_ll, [2.0, theta_init, 0.005],
-                      method="L-BFGS-B",
-                      bounds=[(0.01, 20), (0.001, 0.20), (0.0001, 0.05)])
-    kappa, theta, sigma = res.x
+    mean_3m    = float(short_yield.mean())
+    # Multi-start optimisation to escape local minima on non-convex likelihood
+    bounds = [(0.01, 20), (0.001, 0.20), (0.0001, 0.05)]
+    starts = [
+        (0.5,  theta_init, 0.005),
+        (2.0,  theta_init, 0.005),
+        (5.0,  theta_init, 0.010),
+        (2.0,  mean_3m,    0.005),
+        (10.0, theta_init, 0.010),
+    ]
+    best_res, best_nll = None, np.inf
+    for x0 in starts:
+        try:
+            r = sp_minimize(neg_ll, x0, method="L-BFGS-B", bounds=bounds)
+            if r.fun < best_nll:
+                best_nll = r.fun
+                best_res = r
+        except Exception:
+            continue
+    if best_res is None:
+        kappa, theta, sigma = 2.0, theta_init, 0.005   # fallback
+    else:
+        kappa, theta, sigma = best_res.x
 
     # In-sample RMSE for ensemble weighting
     rv = short_yield.values
@@ -501,7 +550,7 @@ def fit_hull_white(df, horizon_days):
 # ============================================================================
 # SECTION 9 — VAR / VECM  (FIXED: 4 vars, lag <= 3, multi-step forecast)
 # ============================================================================
-def build_econometric(df, diag, horizon_days):
+def build_econometric(df, horizon_days):
     print(f"\n[6/12] Building VAR / VECM  (horizon={horizon_days}d) ...")
     # Reduced variable set (4 vars) to avoid overparameterisation
     var_cols = [YIELD_COLS["5Y"], YIELD_COLS["10Y"],
@@ -517,17 +566,16 @@ def build_econometric(df, diag, horizon_days):
 
     try:
         model = VAR(md)
-        sel   = model.select_order(maxlags=3)   # FIX: capped at 3
+        sel   = model.select_order(maxlags=3)   # capped at 3
         lag   = max(sel.aic, 1)
         vr    = model.fit(lag)
 
-        # FIX: multi-step forecast (not linear extrapolation)
+        # Multi-step forecast (not linear extrapolation)
         steps = max(1, round(horizon_days / 20))
         fcast = vr.forecast(md.values[-lag:], steps=steps)
-        # Cumulative change over all steps (sum of monthly diffs)
         cum_fcast = fcast.sum(axis=0)
 
-        # In-sample RMSE for ensemble weighting (not hardcoded)
+        # In-sample RMSE for ensemble weighting
         resid = vr.resid
         var_rmse = float(np.sqrt(np.mean(resid ** 2)) * 10_000)
         print(f"    VAR({lag}) fitted  |  {len(md)} obs  |  {steps}-step forecast"
@@ -539,17 +587,39 @@ def build_econometric(df, diag, horizon_days):
         except Exception:
             irf = None
 
+        # Johansen cointegration — runs AFTER VAR lag is known
+        # so k_ar_diff matches the selected lag (not hardcoded 2)
         vecm_fcast = None
-        if diag.get("cointegrated"):
+        cointegrated = False
+        coint_rank = 0
+        ml = monthly[monthly.index >= cutoff].dropna()
+        try:
+            if len(ml) > 60:
+                joh = coint_johansen(ml, det_order=0, k_ar_diff=lag)
+                print(f"\n    Johansen Cointegration (k_ar_diff={lag}):")
+                print(f"    {'Hypothesis':18s} {'Trace':>9s} {'Crit-95%':>9s} {'Coint?':>8s}")
+                print("    " + "-" * 48)
+                for i in range(min(len(var_cols), len(joh.lr1))):
+                    tr, cv = joh.lr1[i], joh.cvt[i, 1]
+                    is_c = tr > cv
+                    print(f"    r <= {i}              {tr:9.3f} {cv:9.3f} "
+                          f"{'YES' if is_c else 'no':>8s}")
+                    if is_c:
+                        coint_rank = i + 1
+                cointegrated = coint_rank > 0
+                print(f"    => Cointegrating rank = {coint_rank}")
+        except Exception as e:
+            print(f"    Johansen skipped: {e}")
+
+        if cointegrated:
             try:
-                ml = monthly[monthly.index >= cutoff].dropna()
-                cr = max(1, diag.get("coint_rank", 1))  # from Johansen, not hardcoded
+                cr = max(1, coint_rank)
                 vecm_res = VECM(ml, k_ar_diff=max(lag - 1, 1),
                                 coint_rank=cr).fit()
                 vecm_levels = vecm_res.predict(steps=steps)
                 last_level = monthly.iloc[-1].values
-                vecm_fcast = vecm_levels[-1] - last_level   # change from last
-                print("    VECM fitted (cointegration rank 1)")
+                vecm_fcast = vecm_levels[-1] - last_level
+                print(f"    VECM fitted (cointegration rank {cr})")
             except Exception as e:
                 print(f"    VECM skipped: {e}")
 
@@ -598,12 +668,7 @@ def build_xgboost(features, df, macro_weights, horizon):
             mc = np.abs(Xtr["macro_composite"].values)
             sw = 1.0 + 0.5 * mc / (mc.mean() + 1e-8)
 
-        reg = xgb.XGBRegressor(
-            n_estimators=500, max_depth=6, learning_rate=0.01,
-            subsample=0.8, colsample_bytree=0.7, min_child_weight=5,
-            reg_alpha=0.1, reg_lambda=1.0, eval_metric="rmse",
-            early_stopping_rounds=50,
-            random_state=42, verbosity=0)
+        reg = _make_xgb()   # factory — shared hyperparams
         reg.fit(Xtr, ytr, sample_weight=sw,
                 eval_set=[(Xte, yte)], verbose=False)
 
@@ -614,7 +679,8 @@ def build_xgboost(features, df, macro_weights, horizon):
 
         models[lab] = {"reg": reg, "dir_acc": dir_acc,
                        "rmse": rmse, "mae": mae,
-                       "feats": list(X.columns)}
+                       "feats": list(X.columns),
+                       "n_test": len(Xte)}
 
     print(f"\n  {'Mat':>6s} {'DirAcc':>7s} {'RMSE':>8s} {'MAE':>8s}")
     print("  " + "-" * 32)
@@ -628,15 +694,20 @@ def build_xgboost(features, df, macro_weights, horizon):
 # ============================================================================
 # SECTION 11 — LSTM  (FIXED: scaler fitted on TRAIN only)
 # ============================================================================
-def build_lstm(features, df, horizon, seq_len=60):
+def build_lstm(features, df, horizon):
     if not LSTM_AVAILABLE:
         print("\n[8/12] LSTM -- skipped (TensorFlow not installed)")
         return None
-    print(f"\n[8/12] Building Bi-LSTM  (horizon={horizon}d, seq={seq_len}) ...")
+    # ACF-derived sequence length (data-driven, not hardcoded 60)
+    ref_col = YIELD_COLS.get("10Y") or list(YIELD_COLS.values())[0]
+    seq_len = _compute_seq_len(df[ref_col])
+    print(f"\n[8/12] Building Bi-LSTM  (horizon={horizon}d, seq={seq_len} [ACF-derived]) ...")
     models = {}
     key_mats = ["3M","1Y","2Y","5Y","7Y","10Y","14Y","30Y"]
 
     for lab in key_mats:
+        if lab not in YIELD_COLS:      # safety: maturity may have been filtered
+            continue
         col = YIELD_COLS[lab]
         target = (df[col].shift(-horizon) - df[col]) * 10_000
 
@@ -740,8 +811,7 @@ def build_lstm(features, df, horizon, seq_len=60):
 # ============================================================================
 def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
     print(f"\n[9/12] Generating ensemble predictions ...")
-    # Horizon-dependent FLAT threshold (bps): tighter for short horizons
-    FLAT_BPS = {5: 1, 20: 3, 60: 8}.get(horizon, 3)
+    FLAT_FALLBACK = {5: 1, 20: 3, 60: 8}.get(horizon, 3)
     predictions = {}
     has_lstm = lstm_m is not None
     has_var  = econ is not None
@@ -815,7 +885,9 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
 
         # Direction ALWAYS from sign(ensemble_magnitude) — never from a vote.
         # A vote can contradict magnitude (e.g. "DOWN +6.3 bps") which is nonsense.
-        if abs(emag) < FLAT_BPS:
+        # Per-maturity FLAT threshold from historical data (not hardcoded)
+        flat_bps = _compute_flat_bps(df, col, horizon, FLAT_FALLBACK)
+        if abs(emag) < flat_bps:
             edir = "FLAT"
         elif emag > 0:
             edir = "UP"
@@ -854,8 +926,11 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
             momentum = "N/A"
 
         conf_pct = round(min(econf * 100, 95), 1)
-        # LOW CONFIDENCE: model near coin-flip — don't trust direction
-        low_conf = conf_pct < 55.0
+        # Statistical threshold: reject H0(p=0.5) at alpha=0.10 one-sided
+        # Formula: 50 + z_0.10 * sqrt(0.25/N) * 100 = 50 + 64/sqrt(N)
+        n_test = xgb_m[lab]["n_test"] if lab in xgb_m else 200
+        low_conf_threshold = 50.0 + 64.0 / np.sqrt(max(n_test, 50))
+        low_conf = conf_pct < low_conf_threshold
 
         predictions[lab] = {
             "current_pct":   round(current, 4),
@@ -883,6 +958,8 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
     tscv = TimeSeriesSplit(n_splits=n_folds, test_size=252)
 
     for lab in key_mats:
+        if lab not in YIELD_COLS:      # safety: maturity may have been filtered
+            continue
         col = YIELD_COLS[lab]
         target = (df[col].shift(-horizon) - df[col]) * 10_000
         idx = features.index.intersection(target.dropna().index)
@@ -895,7 +972,7 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
         daccs, rmses, maes, naive_accs = [], [], [], []
 
         for train_i, test_i in tscv.split(X):
-            # FIX: gap between train and test
+            # gap between train and test
             train_end = max(train_i) - horizon
             if train_end < 500:
                 continue
@@ -904,12 +981,8 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
             Xte = X.iloc[test_i]
             yte = y.iloc[test_i]
 
-            reg = xgb.XGBRegressor(
-                n_estimators=300, max_depth=5, learning_rate=0.01,
-                subsample=0.8, colsample_bytree=0.7, min_child_weight=5,
-                reg_alpha=0.1, reg_lambda=1.0, eval_metric="rmse",
-                early_stopping_rounds=30,
-                random_state=42, verbosity=0)
+            reg = _make_xgb(n_estimators=300, max_depth=5,
+                            early_stopping_rounds=30)
             reg.fit(Xtr, ytr, eval_set=[(Xte, yte)], verbose=False)
             pred = reg.predict(Xte)
 
@@ -1123,7 +1196,18 @@ def write_output(preds, bt, macro_w, diag, horizon_label):
 # SECTION 16 — MAIN PIPELINE
 # ============================================================================
 def main():
-    df = load_data()
+    df, mat_real_obs = load_data()
+
+    # Filter out sparse maturities (mostly interpolated, predictions meaningless)
+    sparse = [lab for lab, n in mat_real_obs.items() if n < MIN_MAT_OBS]
+    if sparse:
+        for lab in sparse:
+            YIELD_COLS.pop(lab, None)
+            MATURITIES_YRS.pop(lab, None)
+        DISPLAY_MATS[:] = [m for m in DISPLAY_MATS if m not in sparse]
+        print(f"    Excluded sparse maturities (<{MIN_MAT_OBS} real obs): "
+              f"{sorted(sparse)}")
+
     macro_w = get_macro_weights()
 
     # NSS daily fit
@@ -1149,8 +1233,8 @@ def main():
     # Hull-White
     hw = fit_hull_white(df_a, hdays)
 
-    # VAR/VECM
-    econ = build_econometric(df_a, diag, hdays)
+    # VAR/VECM (Johansen now runs inside, using VAR-selected lag)
+    econ = build_econometric(df_a, hdays)
 
     # XGBoost
     xgb_models = build_xgboost(feats, df_a, macro_w, hdays)
@@ -1173,7 +1257,7 @@ def main():
 
     # ===== FINAL SUMMARY =====
     print("\n" + "=" * 82)
-    print("  PREDICTION SUMMARY  (v3.2)")
+    print("  PREDICTION SUMMARY  (v3.3)")
     print("=" * 82)
     print(f"  Horizon: {hlabel} ({hdays} trading days)\n")
     print(f"  {'Mat':>6s} {'Current':>8s} {'Dir':>7s} {'Chg(bps)':>9s} "
