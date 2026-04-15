@@ -1,6 +1,6 @@
 """
 ================================================================================
-  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.4
+  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5
 ================================================================================
   Multi-Model Ensemble:
     Econometric  —  VAR / VECM  (reduced-form, max 4 vars, lag-capped)
@@ -31,6 +31,23 @@
     6. Negative edge warning when model underperforms baselines
     7. Backtest edge computed vs max(naive, momentum) — harder benchmark
 
+  v3.5 fixes vs v3.4  (13 correctness + disclosure fixes):
+    1. load_data auto-detects percent vs decimal (was a hard assertion crash)
+    2. VAR horizon scaling — forecast rescaled by horizon_days/(steps*20)
+       (was: 1W horizon silently returned a 1-month forecast)
+    3. VAR RMSE scale-matched to horizon via sqrt(h/20) for ensemble weights
+       (was: monthly residual RMSE mixed with daily-horizon RMSEs)
+    4. Granger: monthly data for rate vars, daily for level vars, lag=6 monthly
+    5. VAR excluded-variable disclosure printed at top of build_econometric
+    6. real_yield_10y / term_prem_10y stored in decimal (removed *100 scale mix)
+    7. Bumped NSS cache version to v3.5-multiday (forces refit after fixes)
+    8. LSTM coverage disclosure (maturities fitted vs requested)
+    9. Hull-White theta starts diversified: stressed + dovish + mean regimes
+   10. MIN_MAT_COVERAGE (25% of history) replaces absolute MIN_MAT_OBS
+   11. VAR & HW ensemble confidence derived from in-sample dir-acc, not 0.52/0.60
+   12. Horizon-dependent CI width flag: {5:30, 20:50, 60:100} bps
+   13. Non-interactive mode via predictor_config.json (for Excel launcher)
+
   Data leakage: ZERO. Verified by gap + train-only scaling.
 ================================================================================
 """
@@ -38,7 +55,7 @@
 # ============================================================================
 # SECTION 1 — IMPORTS
 # ============================================================================
-import os, warnings, datetime as dt
+import os, sys, json, warnings, datetime as dt
 from pathlib import Path
 
 import numpy  as np
@@ -76,7 +93,7 @@ except ImportError:
     pass
 
 print("=" * 72)
-print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.4")
+print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5")
 models_str = "VAR/VECM + NSS + Hull-White + XGBoost"
 if LSTM_AVAILABLE:
     models_str += " + Bi-LSTM"
@@ -97,7 +114,35 @@ OUTPUT_SHEET   = "Predictions"
 BACKTEST_SHEET = "Backtest_Results"
 NSS_CACHE      = Path(r"C:\Users\Lenovo\Downloads\nss_params_cache.csv")
 
-MIN_MAT_OBS = 500   # minimum real (pre-interpolation) observations per maturity
+# v3.5 FIX 13b: Non-interactive config. If predictor_config.json exists next
+# to this script (or path is passed via --config), the script runs headless
+# using its contents — no input() prompts. This powers the Excel button
+# launcher: the VBA macro writes a fresh config, shells out to python, and
+# opens the output when done.
+_DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "predictor_config.json"
+
+
+def load_runtime_config():
+    """Load predictor_config.json if present. Returns (config_dict_or_None, path)."""
+    cfg_path = _DEFAULT_CONFIG_PATH
+    if "--config" in sys.argv:
+        try:
+            cfg_path = Path(sys.argv[sys.argv.index("--config") + 1])
+        except (IndexError, ValueError):
+            pass
+    if not cfg_path.exists():
+        return None, cfg_path
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        print(f"  [config] Loaded non-interactive config from {cfg_path.name}")
+        return cfg, cfg_path
+    except Exception as e:
+        print(f"  [config] Failed to read {cfg_path.name}: {e}")
+        return None, cfg_path
+
+MIN_MAT_COVERAGE = 0.25   # min fraction of total history a maturity must cover
+                          # (replaces absolute threshold — scales with dataset size)
 
 YIELD_COLS = {
     "3M":"IN3MT Yield (%)","6M":"IN6MT Yield (%)",
@@ -154,13 +199,33 @@ def load_data():
         mat_real_obs[lab] = int(df[col].notna().sum())
     for col in YIELD_COLS.values():
         df[col] = df[col].interpolate(method="linear")
-    # Unit safety: all rates must be decimal (0.065 = 6.5%), not percent
+    # v3.5 FIX 1: Unit auto-detection — all rates must be decimal (0.065 = 6.5%).
+    # Previous versions asserted and crashed; now we auto-convert percent -> decimal
+    # on a per-column basis (yields, CPI, Repo Rate, IIP). Level vars (USD/INR,
+    # NSE, FII, Crude) are never converted because they are not rates.
+    RATE_MACROS = ("CPI", "Repo Rate", "IIP")
+    _y10_mean = df[YIELD_COLS["10Y"]].mean()
+    if _y10_mean > 1.0:
+        print(f"    [!] Yields look like percent (10Y mean={_y10_mean:.2f}); "
+              f"auto-converting to decimal")
+        for col in YIELD_COLS.values():
+            df[col] = df[col] / 100.0
+    for mname in RATE_MACROS:
+        col = MACRO_COLS.get(mname)
+        if col is None:
+            continue
+        mmean = df[col].mean()
+        if mmean > 1.0:
+            print(f"    [!] {mname} looks like percent (mean={mmean:.2f}); "
+                  f"auto-converting to decimal")
+            df[col] = df[col] / 100.0
+    # Post-conversion sanity check — now these must all be decimal
     _y10 = df[YIELD_COLS["10Y"]].mean()
     _cpi = df[MACRO_COLS["CPI"]].mean()
     _repo = df[MACRO_COLS["Repo Rate"]].mean()
-    assert _y10 < 1.0, f"10Y mean={_y10:.2f} looks like percent, expected decimal"
-    assert _cpi < 1.0, f"CPI mean={_cpi:.2f} looks like percent, expected decimal"
-    assert _repo < 1.0, f"Repo mean={_repo:.2f} looks like percent, expected decimal"
+    assert _y10 < 1.0, f"10Y mean={_y10:.4f} still looks like percent after conversion"
+    assert _cpi < 1.0, f"CPI mean={_cpi:.4f} still looks like percent after conversion"
+    assert _repo < 1.0, f"Repo mean={_repo:.4f} still looks like percent after conversion"
     df.dropna(inplace=True)
     print(f"    Rows: {len(df):,}  |  "
           f"Range: {df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d}")
@@ -170,20 +235,31 @@ def load_data():
 # ============================================================================
 # SECTION 4 — MACRO WEIGHTAGE INPUT
 # ============================================================================
-def get_macro_weights():
+def get_macro_weights(config=None):
+    """Get macro weights. If `config` dict has 'macro_weights', use those
+    (non-interactive mode). Otherwise prompt via stdin."""
     print("\n" + "=" * 72)
     print("  MACRO VARIABLE WEIGHTAGE ASSIGNMENT")
     print("=" * 72)
-    print("  Assign importance weights (0-100). Press Enter for default.\n")
     weights = {}
-    for name, default in DEFAULT_MACRO_WEIGHTS.items():
-        while True:
+    if config and isinstance(config.get("macro_weights"), dict):
+        cfg_w = config["macro_weights"]
+        for name, default in DEFAULT_MACRO_WEIGHTS.items():
             try:
-                raw = input(f"    {name:12s}  [default {default:2d}] : ").strip()
-                weights[name] = float(raw) if raw else default
-                break
-            except ValueError:
-                print("      -> enter a number")
+                weights[name] = float(cfg_w.get(name, default))
+            except (TypeError, ValueError):
+                weights[name] = float(default)
+        print("  Using weights from predictor_config.json (non-interactive).")
+    else:
+        print("  Assign importance weights (0-100). Press Enter for default.\n")
+        for name, default in DEFAULT_MACRO_WEIGHTS.items():
+            while True:
+                try:
+                    raw = input(f"    {name:12s}  [default {default:2d}] : ").strip()
+                    weights[name] = float(raw) if raw else default
+                    break
+                except ValueError:
+                    print("      -> enter a number")
     total = sum(weights.values()) or 1.0
     weights = {k: v / total * 100 for k, v in weights.items()}
     print("\n  Normalised weights:")
@@ -244,8 +320,9 @@ def fit_nss_fast(df):
     """
     print("\n[2/12] Fitting Nelson-Siegel-Svensson (daily) ...")
 
-    # Cache version tag — bump when fitting method changes to force refit
-    NSS_VERSION = "v3.2-multiday"
+    # Cache version tag — bump when fitting method OR upstream unit handling
+    # changes, to force refit (v3.5 changed load_data unit handling)
+    NSS_VERSION = "v3.5-multiday"
     if NSS_CACHE.exists():
         cached = pd.read_csv(NSS_CACHE, index_col=0, parse_dates=True)
         cache_ver = cached.columns[-1] if cached.columns[-1].startswith("ver") else ""
@@ -388,9 +465,12 @@ def engineer_features(df, macro_weights, nss_params):
     w_arr = np.array([macro_weights[k] / 100 for k in MACRO_COLS])
     F["macro_composite"] = z_parts.fillna(0).values @ w_arr
 
-    # real yield & term premium (units verified: both yields and macro in decimal)
-    F["real_yield_10y"] = (df[YIELD_COLS["10Y"]] - df[MACRO_COLS["CPI"]]) * 100
-    F["term_prem_10y"]  = (df[YIELD_COLS["10Y"]] - df[MACRO_COLS["Repo Rate"]]) * 100
+    # v3.5 FIX 6: Real yield & term premium stored in DECIMAL (not *100).
+    # All rates in `df` are decimal, so (y10 - cpi) is naturally decimal.
+    # The *100 previously mixed units with every other feature (which is
+    # either raw decimal or in bps *10_000), poisoning tree splits.
+    F["real_yield_10y"] = df[YIELD_COLS["10Y"]] - df[MACRO_COLS["CPI"]]
+    F["term_prem_10y"]  = df[YIELD_COLS["10Y"]] - df[MACRO_COLS["Repo Rate"]]
 
     F.replace([np.inf, -np.inf], np.nan, inplace=True)
     F.dropna(inplace=True)
@@ -448,29 +528,48 @@ def run_diagnostics(df):
     # NOTE: Johansen cointegration now runs inside build_econometric()
     # so that k_ar_diff matches the VAR-selected lag (not hardcoded 2).
 
-    print(f"\n  Granger Causality  (Macro -> d(10Y),  max lag 3):")
+    # v3.5 FIX 4: Granger causality — rate vars (CPI/Repo/IIP) are MONTHLY
+    # by publication, so daily data with lag=3 tests causality over 3 DAYS
+    # which is meaningless. Use monthly resample + lag=6 (6 months) for
+    # rate vars; daily + lag=3 remains appropriate for level vars.
+    print(f"\n  Granger Causality  (Macro -> d(10Y)):")
+    print(f"  Rate vars: monthly, maxlag=6 (6 months)")
+    print(f"  Level vars: daily, maxlag=5 (1 week)")
     RATE_VARS = {"CPI", "Repo Rate", "IIP"}
     gc = {}
-    ychg = df[YIELD_COLS["10Y"]].diff().dropna()
+    y10_col = YIELD_COLS["10Y"]
+    y10_monthly_d = df[y10_col].resample("ME").last().diff().dropna()
+    y10_daily_d   = df[y10_col].diff().dropna()
     for name, col in MACRO_COLS.items():
         try:
-            # Rate vars: diff() (absolute change); level vars: pct_change()
             if name in RATE_VARS:
-                xchg = df[col].diff().dropna()
+                # Monthly resample, then diff() — absolute change in the rate
+                x_m = df[col].resample("ME").last().diff().dropna()
+                idx = y10_monthly_d.index.intersection(x_m.index)
+                tmp = pd.DataFrame({"y": y10_monthly_d.loc[idx], "x": x_m.loc[idx]})
+                tmp.replace([np.inf, -np.inf], np.nan, inplace=True)
+                tmp.dropna(inplace=True)
+                if len(tmp) < 48:
+                    continue
+                maxlag = min(6, len(tmp) // 8)
             else:
-                xchg = df[col].pct_change().dropna()
-            idx  = ychg.index.intersection(xchg.index)
-            tmp  = pd.DataFrame({"y": ychg.loc[idx], "x": xchg.loc[idx]})
-            tmp.replace([np.inf, -np.inf], np.nan, inplace=True)
-            tmp.dropna(inplace=True)
-            if len(tmp) < 300: continue
-            res = grangercausalitytests(tmp[["y","x"]], maxlag=3, verbose=False)
-            pmin = min(res[lag][0]["ssr_ftest"][1] for lag in range(1, 4))
+                # Level vars: daily pct_change, short lag (1 week)
+                x_d = df[col].pct_change().dropna()
+                idx = y10_daily_d.index.intersection(x_d.index)
+                tmp = pd.DataFrame({"y": y10_daily_d.loc[idx], "x": x_d.loc[idx]})
+                tmp.replace([np.inf, -np.inf], np.nan, inplace=True)
+                tmp.dropna(inplace=True)
+                if len(tmp) < 300:
+                    continue
+                maxlag = 5
+            res  = grangercausalitytests(tmp[["y", "x"]], maxlag=maxlag, verbose=False)
+            pmin = min(res[lag][0]["ssr_ftest"][1] for lag in range(1, maxlag + 1))
             sig  = "***" if pmin < 0.01 else "**" if pmin < 0.05 else "*" if pmin < 0.10 else ""
+            freq = "mo" if name in RATE_VARS else "d "
             gc[name] = pmin
-            print(f"    {name:12s}  p={pmin:.4f}  {sig}")
-        except Exception:
-            pass
+            print(f"    {name:12s} [{freq}] p={pmin:.4f}  {sig}")
+        except Exception as e:
+            print(f"    {name:12s}  skipped ({type(e).__name__})")
     diag["granger"] = gc
     return diag
 
@@ -496,14 +595,24 @@ def fit_hull_white(df, horizon_days):
 
     theta_init = float(df[MACRO_COLS["Repo Rate"]].iloc[-1])
     mean_3m    = float(short_yield.mean())
-    # Multi-start optimisation to escape local minima on non-convex likelihood
+    # v3.5 FIX 9: Diversified theta starting points covering multiple regimes.
+    # Previous starts clustered on current repo (theta_init) — if likelihood
+    # surface has a minimum near historical mean or a stressed regime, the
+    # optimizer never found it. Now starts span: current, mean, +150bps stress,
+    # -100bps dovish. Each theta gets two kappas (fast/slow mean reversion).
     bounds = [(0.01, 20), (0.001, 0.20), (0.0001, 0.05)]
+    theta_hi = min(0.18, theta_init + 0.015)   # stressed (+150 bps)
+    theta_lo = max(0.02, theta_init - 0.010)   # dovish (-100 bps)
     starts = [
         (0.5,  theta_init, 0.005),
         (2.0,  theta_init, 0.005),
         (5.0,  theta_init, 0.010),
         (2.0,  mean_3m,    0.005),
         (10.0, theta_init, 0.010),
+        (1.0,  theta_hi,   0.008),   # stressed regime
+        (3.0,  theta_hi,   0.012),
+        (1.0,  theta_lo,   0.005),   # dovish regime
+        (3.0,  theta_lo,   0.008),
     ]
     best_res, best_nll = None, np.inf
     for x0 in starts:
@@ -523,6 +632,18 @@ def fit_hull_white(df, horizon_days):
     rv = short_yield.values
     r_pred_is = rv[:-1] + kappa * (theta - rv[:-1]) * DT
     hw_rmse = float(np.sqrt(np.mean((rv[1:] - r_pred_is)**2)) * 10_000)
+
+    # v3.5 FIX 13: In-sample directional accuracy for ensemble confidence.
+    # Use 20-day realized vs predicted change (typical horizon). Previously
+    # the ensemble hardcoded HW conf=0.60, which was optimistic for short-end.
+    try:
+        step = 20
+        actual_chg = rv[step:] - rv[:-step]
+        pred_chg   = (theta - rv[:-step]) * (1 - np.exp(-kappa * step * DT))
+        hw_dir_acc = float(np.mean(np.sign(actual_chg) == np.sign(pred_chg)))
+        hw_dir_acc = float(np.clip(hw_dir_acc, 0.50, 0.75))
+    except Exception:
+        hw_dir_acc = 0.60
 
     r_now = float(short_yield.iloc[-1])
     h     = horizon_days * DT
@@ -550,13 +671,17 @@ def fit_hull_white(df, horizon_days):
     ci_width = 2 * 1.65 * ci_v
     print(f"    3M forecast: {r_fc:.4f}  (change: {chg:+.1f} bps, "
           f"90%CI: [{chg - 1.65*ci_v:+.1f}, {chg + 1.65*ci_v:+.1f}])")
-    if ci_width > 80:
-        print(f"    [!] CI width ({ci_width:.0f} bps) is very wide — "
-              f"short-rate prediction unreliable at this horizon")
+    # v3.5 FIX 15: Horizon-dependent CI flag. A 5-day horizon with 80 bps CI
+    # is nonsense; a 60-day horizon with 80 bps is normal. Threshold scales
+    # roughly with sqrt(horizon): {5:30, 20:50, 60:100} bps.
+    ci_thresh = {5: 30, 20: 50, 60: 100}.get(horizon_days, 60)
+    if ci_width > ci_thresh:
+        print(f"    [!] CI width ({ci_width:.0f} bps) exceeds {ci_thresh} bps "
+              f"for {horizon_days}d horizon — short-rate prediction unreliable")
 
     return {"kappa": kappa, "theta": theta, "sigma": sigma,
             "r_forecast": r_fc, "change_bps": chg, "rmse": hw_rmse,
-            "attenuation": att,
+            "attenuation": att, "dir_acc": hw_dir_acc,
             "ci_lo": chg - 1.65 * ci_v, "ci_hi": chg + 1.65 * ci_v}
 
 
@@ -565,7 +690,15 @@ def fit_hull_white(df, horizon_days):
 # ============================================================================
 def build_econometric(df, horizon_days):
     print(f"\n[6/12] Building VAR / VECM  (horizon={horizon_days}d) ...")
-    # Reduced variable set (4 vars) to avoid overparameterisation
+    # v3.5 FIX 5: Variable exclusion disclosure — VAR uses only 4 vars
+    # (kept small on purpose to avoid overparameterisation on ~180 monthly
+    # observations). The excluded macros (FII, USD/INR, Crude, NSE) are
+    # STILL used by XGBoost and LSTM via macro_composite + direct features,
+    # so their information is captured in the ensemble — just not in VAR.
+    included = ["5Y", "10Y", "CPI", "Repo Rate"]
+    excluded = ["FII", "USD/INR", "Crude", "NSE", "IIP"]
+    print(f"    VAR vars (4):  {included}")
+    print(f"    Excluded from VAR (captured by XGB/LSTM): {excluded}")
     var_cols = [YIELD_COLS["5Y"], YIELD_COLS["10Y"],
                 MACRO_COLS["CPI"], MACRO_COLS["Repo Rate"]]
 
@@ -583,16 +716,44 @@ def build_econometric(df, horizon_days):
         lag   = max(sel.aic, 1)
         vr    = model.fit(lag)
 
-        # Multi-step forecast (not linear extrapolation)
-        steps = max(1, round(horizon_days / 20))
+        # v3.5 FIX 2: VAR horizon scaling.
+        # The VAR is fitted on MONTHLY differences, so each forecast step
+        # is ~20 trading days. For horizon=5 (1W), round(5/20)=0 and we'd
+        # previously silently fall back to steps=1 (1 month forecast for a
+        # 1-week request — 4x overstated!). Fix: always compute N steps to
+        # cover horizon, then rescale the cumulative forecast linearly to
+        # the actual horizon. This preserves direction and magnitude scale.
+        steps = max(1, int(np.ceil(horizon_days / 20)))
         fcast = vr.forecast(md.values[-lag:], steps=steps)
-        cum_fcast = fcast.sum(axis=0)
+        cum_raw = fcast.sum(axis=0)                     # N months cumulative
+        scale   = horizon_days / (steps * 20.0)         # 5/(1*20)=0.25, 20/(1*20)=1, 60/(3*20)=1
+        cum_fcast = cum_raw * scale
 
-        # In-sample RMSE for ensemble weighting
+        # v3.5 FIX 3: Scale-match VAR RMSE to the horizon for ensemble weighting.
+        # vr.resid is a ONE-step (one month) residual; XGBoost/LSTM RMSE is
+        # horizon-step residual. Mixing them gives VAR inflated/deflated weight.
+        # Under iid innovations, multi-step RMSE scales as sqrt(steps), and
+        # rescaling by `scale` gives horizon-equivalent variance.
         resid = vr.resid
-        var_rmse = float(np.sqrt(np.mean(resid ** 2)) * 10_000)
+        var_rmse_monthly = float(np.sqrt(np.mean(resid ** 2)) * 10_000)
+        var_rmse = var_rmse_monthly * np.sqrt(steps) * scale
+
+        # v3.5 FIX 13: In-sample directional accuracy for ensemble confidence.
+        # Previous code used a hardcoded 0.52 which understated VAR.
+        # Here we use one-step in-sample residuals as a proxy for sign skill.
+        try:
+            y10_in_sample = md[YIELD_COLS["10Y"]].values[lag:]   # actual
+            y10_pred_is   = y10_in_sample - resid[:, 1]          # fitted
+            var_dir_acc = float(np.mean(np.sign(y10_in_sample) == np.sign(y10_pred_is)))
+            var_dir_acc = float(np.clip(var_dir_acc, 0.50, 0.70))   # conservative cap
+        except Exception:
+            var_dir_acc = 0.52
+
         print(f"    VAR({lag}) fitted  |  {len(md)} obs  |  {steps}-step forecast"
-              f"  |  RMSE={var_rmse:.1f} bps")
+              f"  |  scale={scale:.2f}")
+        print(f"    RMSE (monthly)={var_rmse_monthly:.1f} bps  "
+              f"-> RMSE ({horizon_days}d)={var_rmse:.1f} bps  "
+              f"|  dir_acc={var_dir_acc:.1%}")
 
         try:
             irf = vr.irf(periods=12)
@@ -631,7 +792,9 @@ def build_econometric(df, horizon_days):
                                 coint_rank=cr).fit()
                 vecm_levels = vecm_res.predict(steps=steps)
                 last_level = monthly.iloc[-1].values
-                vecm_fcast = vecm_levels[-1] - last_level
+                vecm_raw = vecm_levels[-1] - last_level
+                # v3.5 FIX 2 (VECM): same horizon rescaling as VAR
+                vecm_fcast = vecm_raw * scale
                 print(f"    VECM fitted (cointegration rank {cr})")
             except Exception as e:
                 print(f"    VECM skipped: {e}")
@@ -643,7 +806,8 @@ def build_econometric(df, horizon_days):
 
         return {"var": vr, "forecast": cum_fcast, "vecm_forecast": vecm_fcast,
                 "cols": var_cols, "irf": irf, "fevd": fevd,
-                "rmse": var_rmse}
+                "rmse": var_rmse, "dir_acc": var_dir_acc,
+                "horizon_scale": scale}
     except Exception as e:
         print(f"    VAR failed: {e}")
         return None
@@ -818,6 +982,20 @@ def build_lstm(features, df, horizon):
                        "rmse": rmse, "dir_acc": dacc}
         print(f"    {lab:>4s}:  DirAcc={dacc:.1%}   RMSE={rmse:.1f} bps")
 
+    # v3.5 FIX 8: LSTM coverage disclosure — which key maturities got fitted,
+    # which got skipped (insufficient data / filtered), and how many gated
+    # out in the ensemble (dir_acc <= 0.50 -> anticorrelated).
+    fitted  = sorted(models.keys())
+    want    = [m for m in key_mats if m in YIELD_COLS]
+    skipped = [m for m in want if m not in fitted]
+    gated   = [m for m in fitted if models[m]["dir_acc"] <= 0.50]
+    print(f"\n    LSTM coverage:  fitted {len(fitted)}/{len(want)}  "
+          f"({fitted})")
+    if skipped:
+        print(f"    Skipped (insufficient data): {skipped}")
+    if gated:
+        print(f"    [!] Gated out of ensemble (dir_acc <= 50%): {gated}")
+
     return models if models else None
 
 
@@ -869,9 +1047,10 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
             if econ["vecm_forecast"] is not None:
                 vmag2 = float(econ["vecm_forecast"][ci_idx]) * 10_000
                 vmag = 0.5 * vmag + 0.5 * vmag2
+            # v3.5 FIX 13: use econ.dir_acc (in-sample) not hardcoded 0.52
             sources.append({"src": "VAR", "mag": vmag,
                             "dir": "UP" if vmag > 0 else "DOWN",
-                            "conf": 0.52,
+                            "conf": econ.get("dir_acc", 0.52),
                             "rmse": econ.get("rmse", 30.0)})
 
         # --- Hull-White (short end only) ---
@@ -880,9 +1059,10 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
             if lab != "3M":
                 # Use data-driven attenuation (not hardcoded 0.85/0.70)
                 hw_mag *= hw.get("attenuation", {}).get(lab, 0.75)
+            # v3.5 FIX 13: use hw.dir_acc (in-sample) not hardcoded 0.60
             sources.append({"src": "HullWhite", "mag": hw_mag,
                             "dir": "UP" if hw_mag > 0 else "DOWN",
-                            "conf": 0.60,
+                            "conf": hw.get("dir_acc", 0.60),
                             "rmse": hw.get("rmse", 20.0)})
 
         if not sources:
@@ -1245,19 +1425,29 @@ def write_output(preds, bt, macro_w, diag, horizon_label):
 # SECTION 16 — MAIN PIPELINE
 # ============================================================================
 def main():
+    # v3.5 FIX 13b: Load non-interactive config first. If a config file
+    # exists (Excel launcher mode), use it for macro weights + horizon.
+    config, _cfg_path = load_runtime_config()
+    non_interactive = config is not None
+
     df, mat_real_obs = load_data()
 
-    # Filter out sparse maturities (mostly interpolated, predictions meaningless)
-    sparse = [lab for lab, n in mat_real_obs.items() if n < MIN_MAT_OBS]
+    # v3.5 FIX 12: Relative coverage filter (replaces absolute MIN_MAT_OBS).
+    # A maturity must have real observations covering >= MIN_MAT_COVERAGE
+    # of the dataset. Dataset-size-invariant: 500 real obs of a 2000-row
+    # dataset now fails (25%=500), but of a 6000-row dataset it'd need 1500.
+    total_rows = len(df)
+    min_obs_needed = max(200, int(total_rows * MIN_MAT_COVERAGE))
+    sparse = [lab for lab, n in mat_real_obs.items() if n < min_obs_needed]
     if sparse:
         for lab in sparse:
             YIELD_COLS.pop(lab, None)
             MATURITIES_YRS.pop(lab, None)
         DISPLAY_MATS[:] = [m for m in DISPLAY_MATS if m not in sparse]
-        print(f"    Excluded sparse maturities (<{MIN_MAT_OBS} real obs): "
-              f"{sorted(sparse)}")
+        print(f"    Excluded sparse maturities (<{min_obs_needed} real obs, "
+              f"{MIN_MAT_COVERAGE:.0%} of {total_rows}): {sorted(sparse)}")
 
-    macro_w = get_macro_weights()
+    macro_w = get_macro_weights(config)
 
     # NSS daily fit
     nss_params = fit_nss_fast(df)
@@ -1270,14 +1460,21 @@ def main():
     diag = run_diagnostics(df_a)
 
     # Horizon
+    HMAP = {"1":("1W",5), "2":("1M",20), "3":("3M",60),
+            "1W":("1W",5), "1M":("1M",20), "3M":("3M",60)}
     print("\n" + "=" * 72)
     print("  SELECT PREDICTION HORIZON")
     print("=" * 72)
-    print("    1) 1 Week   (5 trading days)")
-    print("    2) 1 Month  (20 trading days)")
-    print("    3) 3 Months (60 trading days)")
-    choice = input("\n    Choice [1/2/3, default=2]: ").strip()
-    hlabel, hdays = {"1":("1W",5),"2":("1M",20),"3":("3M",60)}.get(choice, ("1M",20))
+    if non_interactive:
+        h_key = str(config.get("horizon", "1M")).strip()
+        hlabel, hdays = HMAP.get(h_key, ("1M", 20))
+        print(f"    Using horizon from config: {hlabel} ({hdays} trading days)")
+    else:
+        print("    1) 1 Week   (5 trading days)")
+        print("    2) 1 Month  (20 trading days)")
+        print("    3) 3 Months (60 trading days)")
+        choice = input("\n    Choice [1/2/3, default=2]: ").strip()
+        hlabel, hdays = HMAP.get(choice, ("1M", 20))
 
     # Hull-White
     hw = fit_hull_white(df_a, hdays)
@@ -1306,7 +1503,7 @@ def main():
 
     # ===== FINAL SUMMARY =====
     print("\n" + "=" * 82)
-    print("  PREDICTION SUMMARY  (v3.4)")
+    print("  PREDICTION SUMMARY  (v3.5)")
     print("=" * 82)
     print(f"  Horizon: {hlabel} ({hdays} trading days)\n")
     print(f"  {'Mat':>6s} {'Current':>8s} {'Dir':>7s} {'Chg(bps)':>9s} "
