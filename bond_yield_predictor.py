@@ -1,6 +1,6 @@
 """
 ================================================================================
-  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.1
+  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.3
 ================================================================================
   Multi-Model Ensemble:
     Econometric  —  VAR / VECM  (reduced-form, max 4 vars, lag-capped)
@@ -31,18 +31,34 @@
     6. Negative edge warning when model underperforms baselines
     7. Backtest edge computed vs max(naive, momentum) — harder benchmark
 
-  v3.5.2 patch vs v3.5.1  (3 regime-handling fixes):
-    A. LSTM hard 2015 cutoff — v3.5.1 applied the cutoff only to XGBoost,
-       leaving LSTM trained on 1998-2026 mixed regimes. Result: ALL LSTM
-       maturities gated out at <52% dir_acc. Now LSTM drops rows <2015.
-    B. XGBoost replaces hard cutoff with EXPONENTIAL TIME-DECAY sample
-       weights. Pre-2015 rows still contribute structural signal but are
-       down-weighted (decay=0.0005/row) so 2015+ dominates. More principled
-       than a binary cutoff.
-    C. Backtest mirrors the XGBoost time-decay weights — previously
-       backtest walk-forward saw plain-weighted 1998 folds while XGBoost
-       saw 2015+ only, producing a 29% dir_acc gap (3M: 70% vs 41%).
-       Now directly comparable.
+  v3.5.3 patch vs v3.5.2  (6 fixes after regime-handling review):
+    1. XGBoost: hard post-2015 cutoff AND gentle time-decay (0.00005) inside
+       that window. v3.5.2's decay=0.0005 over all 7431 rows created a 41x
+       weight ratio, destroying XGBoost (all maturities <50% dir_acc).
+       v3.5.1's hard cutoff alone overfit the 2015+ rate-cut cycle
+       (70% build vs 41% backtest — 29bp gap). v3.5.3 combines both:
+       regime isolation + mild within-window emphasis of recent tail.
+    2. Backtest: same post-2015 restriction (plus test_size=150 to keep
+       earliest folds viable). Walk-forward DirAcc now directly comparable
+       to build_xgboost() test-set DirAcc.
+    3. Feature set: ADD forward-spot spreads (2y-5y, 5y-10y, 10y-15y, 2y-10y)
+       from existing NSS curve — market-implied direction signal with zero
+       extra cost. ADD RBI policy stance flag from 60d repo-rate diff
+       (hike/hold/cut) — strong signal for short end.
+    4. Feature scale: real_yield_10y and term_prem_10y moved from raw
+       decimal to bps (*10_000) to match slope_*, butterfly, dy*_* and
+       prevent RobustScaler distortion in LSTM.
+    5. macro_composite z-score warm-up: bfill (not fillna(0)) so the first
+       252 rows inherit the first valid regime reading instead of a false
+       "neutral" signal — 2015 was an active RBI cutting year, not neutral.
+    6. VAR ensemble weight: 1.5x out-of-sample penalty on VAR RMSE (its
+       value is in-sample) + 20% hard weight cap. Prevents in-sample/OOS
+       mismatch from over-weighting VAR in the inverse-RMSE calculation.
+
+  v3.5.2 patch vs v3.5.1  (superseded by v3.5.3 — kept for historical trace):
+    A. LSTM hard 2015 cutoff — fixed LSTM regime contamination.
+    B. XGBoost decay-only (too aggressive at 0.0005 — reverted in v3.5.3).
+    C. Backtest mirrored XGBoost decay (now also uses hard cutoff).
 
   v3.5.1 patch vs v3.5  (5 post-run fixes from first live-output review):
     1a. LSTM reproducibility — tf/np/random seeds + op-determinism.
@@ -120,7 +136,7 @@ except ImportError:
     pass
 
 print("=" * 72)
-print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.2")
+print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.3")
 models_str = "VAR/VECM + NSS + Hull-White + XGBoost"
 if LSTM_AVAILABLE:
     models_str += " + Bi-LSTM"
@@ -179,8 +195,9 @@ MIN_MAT_COVERAGE = 0.25   # min fraction of total history a maturity must cover
 # (worse than coin flip = anti-prediction). Restricting training to
 # >= 2015 matches the actual Refinitiv daily-quote era and the regime
 # the production model is being asked to forecast.
-XGB_TRAIN_START = pd.Timestamp("2015-01-01")   # LSTM hard cutoff (v3.5.2)
-XGB_TIME_DECAY  = 0.0005                        # XGBoost/backtest exp decay (v3.5.2)
+XGB_TRAIN_START = pd.Timestamp("2015-01-01")   # hard cutoff: XGBoost + LSTM + backtest (v3.5.3)
+XGB_TIME_DECAY  = 0.00005                       # gentle decay INSIDE post-2015 window (v3.5.3)
+                                                 # (~9% lift newest vs oldest over ~1800 rows)
 
 YIELD_COLS = {
     "3M":"IN3MT Yield (%)","6M":"IN6MT Yield (%)",
@@ -360,7 +377,7 @@ def fit_nss_fast(df):
 
     # Cache version tag — bump when fitting method OR upstream unit handling
     # changes, to force refit (v3.5 changed load_data unit handling)
-    NSS_VERSION = "v3.5-multiday"
+    NSS_VERSION = "v3.5.3-post-exclusion"
     if NSS_CACHE.exists():
         cached = pd.read_csv(NSS_CACHE, index_col=0, parse_dates=True)
         cache_ver = cached.columns[-1] if cached.columns[-1].startswith("ver") else ""
@@ -500,15 +517,47 @@ def engineer_features(df, macro_weights, nss_params):
         mu  = chg.rolling(252, min_periods=60).mean()
         sig = chg.rolling(252, min_periods=60).std()
         z_parts[name] = ((chg - mu) / (sig + 1e-12)).clip(-4, 4)
+    # v3.5.3 FIX: bfill instead of fillna(0). fillna(0) tells the model the
+    # macro environment was "perfectly neutral" for the first 252 rows,
+    # which is factually wrong — early 2015 was an active RBI cutting cycle.
+    # bfill inherits the first valid z-score reading so the warm-up window
+    # carries the regime that immediately followed it, not a false neutral.
+    z_parts = z_parts.bfill().fillna(0)     # bfill first, fallback 0 for all-NaN cols
     w_arr = np.array([macro_weights[k] / 100 for k in MACRO_COLS])
-    F["macro_composite"] = z_parts.fillna(0).values @ w_arr
+    F["macro_composite"] = z_parts.values @ w_arr
 
-    # v3.5 FIX 6: Real yield & term premium stored in DECIMAL (not *100).
-    # All rates in `df` are decimal, so (y10 - cpi) is naturally decimal.
-    # The *100 previously mixed units with every other feature (which is
-    # either raw decimal or in bps *10_000), poisoning tree splits.
-    F["real_yield_10y"] = df[YIELD_COLS["10Y"]] - df[MACRO_COLS["CPI"]]
-    F["term_prem_10y"]  = df[YIELD_COLS["10Y"]] - df[MACRO_COLS["Repo Rate"]]
+    # v3.5.3 FIX: real_yield / term_prem scaled to bps (*10_000) to match
+    # every other yield-differential feature (slope_*, butterfly, dy*_*).
+    # v3.5 had these in raw decimal (~0.01-0.03), which is 4 orders of
+    # magnitude smaller than bps features and distorts RobustScaler in LSTM.
+    F["real_yield_10y"] = (df[YIELD_COLS["10Y"]] - df[MACRO_COLS["CPI"]])       * 10_000
+    F["term_prem_10y"]  = (df[YIELD_COLS["10Y"]] - df[MACRO_COLS["Repo Rate"]]) * 10_000
+
+    # ----------------------------------------------------------------------
+    # v3.5.3 NEW FEATURES — directional signal boosters
+    # ----------------------------------------------------------------------
+    # (A) Forward-spot spreads from the existing yield curve. The forward
+    # rate F(t1,t2) = (t2*y2 - t1*y1)/(t2-t1); forward minus spot y2
+    # captures the market-implied direction for that maturity segment.
+    # Zero extra cost — uses yields we already store.
+    FWD_PAIRS = [(2, 5, "2_5"), (5, 10, "5_10"), (10, 15, "10_15"), (2, 10, "2_10")]
+    for t1, t2, name in FWD_PAIRS:
+        k1, k2 = f"{t1}Y", f"{t2}Y"
+        if k1 in YIELD_COLS and k2 in YIELD_COLS:
+            y1 = df[YIELD_COLS[k1]]
+            y2 = df[YIELD_COLS[k2]]
+            fwd = (t2 * y2 - t1 * y1) / (t2 - t1)
+            F[f"fwd_spread_{name}"] = (fwd - y2) * 10_000   # bps
+
+    # (B) RBI policy stance flag — derived from 60d repo change, not dates.
+    # Threshold 10 bps (0.001) because Indian RBI moves in 25-50 bp steps,
+    # so anything below 10 bps over 3 months is just noise / unchanged.
+    repo = df[MACRO_COLS["Repo Rate"]]
+    repo_3m_chg = repo.diff(60)
+    F["rbi_stance"] = np.where(repo_3m_chg > 0.001, 1,       # hiking
+                        np.where(repo_3m_chg < -0.001, -1,    # cutting
+                        0))                                    # on-hold
+    F["rbi_stance_ma20"] = F["rbi_stance"].rolling(20).mean()
 
     F.replace([np.inf, -np.inf], np.nan, inplace=True)
     F.dropna(inplace=True)
@@ -856,11 +905,13 @@ def build_econometric(df, horizon_days):
 # ============================================================================
 def build_xgboost(features, df, macro_weights, horizon):
     print(f"\n[7/12] Building XGBoost  (horizon = {horizon}d) ...")
-    # v3.5.2: exponential time-decay sample weights replace hard 2015 cutoff.
-    # Pre-2015 data still contributes structural signal but is down-weighted
-    # so the current regime dominates. Tune XGB_TIME_DECAY to shift the
-    # effective half-life (higher = faster decay of old data).
-    print(f"    Time-decay sample weights  (decay={XGB_TIME_DECAY:.4f}/row)")
+    # v3.5.3: hard 2015 cutoff AND gentle time-decay within post-2015 window.
+    # v3.5.3 removed the cutoff entirely and got destroyed by 1998-2014 noise.
+    # v3.5.1 used only the cutoff and overfit the 2015+ rate-cut cycle (70% -> 39% backtest).
+    # v3.5.3: post-2015 only, with decay=0.00005 (8x gentler than v3.5.3's 0.0005)
+    # so the 2015-2023 rate-cycle variation is still visible under the 2024-2026 tail.
+    print(f"    Training window: >= {XGB_TRAIN_START:%Y-%m-%d}  "
+          f"|  decay={XGB_TIME_DECAY:.5f}/row")
     models = {}
 
     for lab, col in YIELD_COLS.items():
@@ -869,6 +920,10 @@ def build_xgboost(features, df, macro_weights, horizon):
         X, y = features.loc[idx].copy(), target.loc[idx].copy()
         mask = np.isfinite(y) & np.all(np.isfinite(X.values), axis=1)
         X, y = X[mask], y[mask]
+        # v3.5.3: hard post-2015 restriction (LSTM uses same cutoff, keeps
+        # both models in the same regime — backtest now applies this too)
+        X = X[X.index >= XGB_TRAIN_START]
+        y = y.loc[X.index]
         if len(X) < 800:
             continue
 
@@ -882,7 +937,10 @@ def build_xgboost(features, df, macro_weights, horizon):
         if len(Xtr) < 500 or len(Xte) < 50:
             continue
 
-        # v3.5.2: exponential time-decay weights (recent rows weighted higher)
+        # v3.5.3: gentle decay INSIDE the post-2015 window — recent
+        # 2024-2026 rows slightly emphasised, 2015-2023 still contributes.
+        # With ~1800 train rows and decay=0.00005, ratio = exp(0.00005*1800) = 1.094
+        # i.e. ~9% lift on newest vs oldest row — not destructive.
         n = len(Xtr)
         time_weights = np.exp(XGB_TIME_DECAY * np.arange(n))
         time_weights /= time_weights.mean()
@@ -977,7 +1035,7 @@ def build_lstm(features, df, horizon):
                 break
 
         idx = features.index.intersection(target.dropna().index)
-        # v3.5.2: hard regime cutoff for LSTM — sequence models cannot be
+        # v3.5.3: hard regime cutoff for LSTM — sequence models cannot be
         # reweighted row-wise the way XGBoost can, so the simplest way to
         # remove 1998-era regime contamination is a hard start date.
         idx = idx[idx >= XGB_TRAIN_START]
@@ -1145,8 +1203,32 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
             continue
 
         # FIX: performance-adaptive weights (inverse RMSE)
-        inv_rmse = np.array([1.0 / (s["rmse"] + 1e-6) for s in sources])
+        # v3.5.3 FIX: VAR reports IN-SAMPLE residual RMSE while XGBoost/LSTM
+        # report OUT-OF-SAMPLE test-set RMSE. Raw inverse-RMSE weighting
+        # therefore systematically over-weights VAR. Apply a 1.5x penalty
+        # to VAR's RMSE (typical in-sample/out-of-sample bias ratio) before
+        # the weight computation, then hard-cap VAR at 20% of total weight.
+        VAR_OOS_PENALTY = 1.5
+        VAR_WEIGHT_CAP  = 0.20
+        rmses_adj = []
+        for s in sources:
+            r = s["rmse"]
+            if s["src"] == "VAR":
+                r = r * VAR_OOS_PENALTY
+            rmses_adj.append(r)
+        inv_rmse = np.array([1.0 / (r + 1e-6) for r in rmses_adj])
         weights  = inv_rmse / inv_rmse.sum()
+        # Apply VAR cap: if VAR exceeds 20%, redistribute excess to the rest
+        var_idx = [i for i, s in enumerate(sources) if s["src"] == "VAR"]
+        if var_idx and len(sources) > 1:
+            vi = var_idx[0]
+            if weights[vi] > VAR_WEIGHT_CAP:
+                excess = weights[vi] - VAR_WEIGHT_CAP
+                weights[vi] = VAR_WEIGHT_CAP
+                other_mask = np.array([i != vi for i in range(len(sources))])
+                other_sum = weights[other_mask].sum()
+                if other_sum > 0:
+                    weights[other_mask] += excess * (weights[other_mask] / other_sum)
         for i, s in enumerate(sources):
             s["w"] = float(weights[i])
 
@@ -1226,7 +1308,9 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
     print(f"        [XGBoost-only component — ensemble accuracy may differ]")
     results = {}
     key_mats = ["3M","1Y","2Y","5Y","7Y","10Y","14Y","30Y"]
-    tscv = TimeSeriesSplit(n_splits=n_folds, test_size=252)
+    # v3.5.3: with post-2015 window (~2700 rows), test_size=252 leaves too
+    # little train data for the earliest fold. Shrink to 150 (~7 months).
+    tscv = TimeSeriesSplit(n_splits=n_folds, test_size=150)
 
     for lab in key_mats:
         if lab not in YIELD_COLS:      # safety: maturity may have been filtered
@@ -1237,7 +1321,14 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
         X, y = features.loc[idx], target.loc[idx]
         mask = np.isfinite(y) & np.all(np.isfinite(X.values), axis=1)
         X, y = X[mask], y[mask]
-        if len(X) < 2000:
+        # v3.5.3: match live XGBoost training window so walk-forward folds
+        # measure out-of-sample accuracy in the SAME regime the live model
+        # sees. Without this, early folds cover 1998-2014 rising-rate data
+        # while the live model is trained on 2015+, making the comparison
+        # invalid (v3.5.1 observed: XGB 70% vs backtest 41% => 29bp gap).
+        X = X[X.index >= XGB_TRAIN_START]
+        y = y.loc[X.index]
+        if len(X) < 1500:
             continue
 
         daccs, rmses, maes, naive_accs, mom_accs = [], [], [], [], []
@@ -1254,7 +1345,7 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
             Xte = X.iloc[test_i]
             yte = y.iloc[test_i]
 
-            # v3.5.2: mirror the live XGBoost time-decay weighting so
+            # v3.5.3: mirror the live XGBoost time-decay weighting so
             # backtest DirAcc is directly comparable to the build_xgboost()
             # single-split DirAcc (both now emphasise the recent regime).
             n_tr = len(Xtr)
@@ -1601,7 +1692,7 @@ def main():
 
     # ===== FINAL SUMMARY =====
     print("\n" + "=" * 82)
-    print("  PREDICTION SUMMARY  (v3.5.2)")
+    print("  PREDICTION SUMMARY  (v3.5.3)")
     print("=" * 82)
     print(f"  Horizon: {hlabel} ({hdays} trading days)\n")
     print(f"  {'Mat':>6s} {'Current':>8s} {'Dir':>7s} {'Chg(bps)':>9s} "
