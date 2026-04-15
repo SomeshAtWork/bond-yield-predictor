@@ -31,6 +31,19 @@
     6. Negative edge warning when model underperforms baselines
     7. Backtest edge computed vs max(naive, momentum) — harder benchmark
 
+  v3.5.2 patch vs v3.5.1  (3 regime-handling fixes):
+    A. LSTM hard 2015 cutoff — v3.5.1 applied the cutoff only to XGBoost,
+       leaving LSTM trained on 1998-2026 mixed regimes. Result: ALL LSTM
+       maturities gated out at <52% dir_acc. Now LSTM drops rows <2015.
+    B. XGBoost replaces hard cutoff with EXPONENTIAL TIME-DECAY sample
+       weights. Pre-2015 rows still contribute structural signal but are
+       down-weighted (decay=0.0005/row) so 2015+ dominates. More principled
+       than a binary cutoff.
+    C. Backtest mirrors the XGBoost time-decay weights — previously
+       backtest walk-forward saw plain-weighted 1998 folds while XGBoost
+       saw 2015+ only, producing a 29% dir_acc gap (3M: 70% vs 41%).
+       Now directly comparable.
+
   v3.5.1 patch vs v3.5  (5 post-run fixes from first live-output review):
     1a. LSTM reproducibility — tf/np/random seeds + op-determinism.
         Without these, two runs of the SAME code on the SAME data
@@ -107,7 +120,7 @@ except ImportError:
     pass
 
 print("=" * 72)
-print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.1")
+print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.2")
 models_str = "VAR/VECM + NSS + Hull-White + XGBoost"
 if LSTM_AVAILABLE:
     models_str += " + Bi-LSTM"
@@ -166,7 +179,8 @@ MIN_MAT_COVERAGE = 0.25   # min fraction of total history a maturity must cover
 # (worse than coin flip = anti-prediction). Restricting training to
 # >= 2015 matches the actual Refinitiv daily-quote era and the regime
 # the production model is being asked to forecast.
-XGB_TRAIN_START = pd.Timestamp("2015-01-01")
+XGB_TRAIN_START = pd.Timestamp("2015-01-01")   # LSTM hard cutoff (v3.5.2)
+XGB_TIME_DECAY  = 0.0005                        # XGBoost/backtest exp decay (v3.5.2)
 
 YIELD_COLS = {
     "3M":"IN3MT Yield (%)","6M":"IN6MT Yield (%)",
@@ -842,14 +856,11 @@ def build_econometric(df, horizon_days):
 # ============================================================================
 def build_xgboost(features, df, macro_weights, horizon):
     print(f"\n[7/12] Building XGBoost  (horizon = {horizon}d) ...")
-    # v3.5.1 FIX 2b: Training data cutoff disclosure
-    feat_start = features.index.min()
-    effective_start = max(feat_start, XGB_TRAIN_START)
-    if feat_start < XGB_TRAIN_START:
-        n_dropped = (features.index < XGB_TRAIN_START).sum()
-        print(f"    Train cutoff: {XGB_TRAIN_START:%Y-%m-%d}  "
-              f"(dropping {n_dropped:,} pre-cutoff rows from "
-              f"{feat_start:%Y-%m-%d})")
+    # v3.5.2: exponential time-decay sample weights replace hard 2015 cutoff.
+    # Pre-2015 data still contributes structural signal but is down-weighted
+    # so the current regime dominates. Tune XGB_TIME_DECAY to shift the
+    # effective half-life (higher = faster decay of old data).
+    print(f"    Time-decay sample weights  (decay={XGB_TIME_DECAY:.4f}/row)")
     models = {}
 
     for lab, col in YIELD_COLS.items():
@@ -858,11 +869,6 @@ def build_xgboost(features, df, macro_weights, horizon):
         X, y = features.loc[idx].copy(), target.loc[idx].copy()
         mask = np.isfinite(y) & np.all(np.isfinite(X.values), axis=1)
         X, y = X[mask], y[mask]
-        # v3.5.1 FIX 2b: restrict to the low-rate regime that matches the
-        # forecast environment. Applies per-maturity after NaN masking so
-        # row counts still gate properly.
-        X = X[X.index >= XGB_TRAIN_START]
-        y = y.loc[X.index]
         if len(X) < 800:
             continue
 
@@ -876,11 +882,14 @@ def build_xgboost(features, df, macro_weights, horizon):
         if len(Xtr) < 500 or len(Xte) < 50:
             continue
 
-        # sample weights
-        sw = np.ones(len(Xtr))
+        # v3.5.2: exponential time-decay weights (recent rows weighted higher)
+        n = len(Xtr)
+        time_weights = np.exp(XGB_TIME_DECAY * np.arange(n))
+        time_weights /= time_weights.mean()
+        sw = time_weights.copy()
         if "macro_composite" in Xtr.columns:
             mc = np.abs(Xtr["macro_composite"].values)
-            sw = 1.0 + 0.5 * mc / (mc.mean() + 1e-8)
+            sw = time_weights * (1.0 + 0.5 * mc / (mc.mean() + 1e-8))
 
         reg = _make_xgb()   # factory — shared hyperparams
         reg.fit(Xtr, ytr, sample_weight=sw,
@@ -968,6 +977,10 @@ def build_lstm(features, df, horizon):
                 break
 
         idx = features.index.intersection(target.dropna().index)
+        # v3.5.2: hard regime cutoff for LSTM — sequence models cannot be
+        # reweighted row-wise the way XGBoost can, so the simplest way to
+        # remove 1998-era regime contamination is a hard start date.
+        idx = idx[idx >= XGB_TRAIN_START]
         Xf  = features[keep].loc[idx].values
         yf  = target.loc[idx].values
         mask = np.isfinite(yf) & np.all(np.isfinite(Xf), axis=1)
@@ -1224,11 +1237,6 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
         X, y = features.loc[idx], target.loc[idx]
         mask = np.isfinite(y) & np.all(np.isfinite(X.values), axis=1)
         X, y = X[mask], y[mask]
-        # v3.5.1 FIX 2b: apply the same training cutoff to backtest so
-        # backtest accuracy reflects the production-time regime, not a
-        # 1998-era regime the live model will never see.
-        X = X[X.index >= XGB_TRAIN_START]
-        y = y.loc[X.index]
         if len(X) < 2000:
             continue
 
@@ -1246,9 +1254,16 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
             Xte = X.iloc[test_i]
             yte = y.iloc[test_i]
 
+            # v3.5.2: mirror the live XGBoost time-decay weighting so
+            # backtest DirAcc is directly comparable to the build_xgboost()
+            # single-split DirAcc (both now emphasise the recent regime).
+            n_tr = len(Xtr)
+            sw_tr = np.exp(XGB_TIME_DECAY * np.arange(n_tr))
+            sw_tr /= sw_tr.mean()
             reg = _make_xgb(n_estimators=300, max_depth=5,
                             early_stopping_rounds=30)
-            reg.fit(Xtr, ytr, eval_set=[(Xte, yte)], verbose=False)
+            reg.fit(Xtr, ytr, sample_weight=sw_tr,
+                    eval_set=[(Xte, yte)], verbose=False)
             pred = reg.predict(Xte)
 
             daccs.append(np.mean(np.sign(yte) == np.sign(pred)))
@@ -1586,7 +1601,7 @@ def main():
 
     # ===== FINAL SUMMARY =====
     print("\n" + "=" * 82)
-    print("  PREDICTION SUMMARY  (v3.5.1)")
+    print("  PREDICTION SUMMARY  (v3.5.2)")
     print("=" * 82)
     print(f"  Horizon: {hlabel} ({hdays} trading days)\n")
     print(f"  {'Mat':>6s} {'Current':>8s} {'Dir':>7s} {'Chg(bps)':>9s} "
