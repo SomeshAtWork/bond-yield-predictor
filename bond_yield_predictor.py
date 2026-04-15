@@ -1,6 +1,6 @@
 """
 ================================================================================
-  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5
+  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.1
 ================================================================================
   Multi-Model Ensemble:
     Econometric  —  VAR / VECM  (reduced-form, max 4 vars, lag-capped)
@@ -30,6 +30,20 @@
     5. Hull-White CI width > 80 bps flagged as unreliable
     6. Negative edge warning when model underperforms baselines
     7. Backtest edge computed vs max(naive, momentum) — harder benchmark
+
+  v3.5.1 patch vs v3.5  (5 post-run fixes from first live-output review):
+    1a. LSTM reproducibility — tf/np/random seeds + op-determinism.
+        Without these, two runs of the SAME code on the SAME data
+        produced opposite directions on 2Y (DOWN -10.9 bps <-> UP +3.7).
+    1b. LSTM fit() shuffle=False — Keras default shuffles batches, which
+        breaks temporal order of a time series (data-leakage-adjacent).
+    1c. LSTM ensemble gating raised 0.50 -> 0.52 — 50% was a fragile
+        boundary; 49.8% vs 50.2% flips should not change predictions.
+    2a. 40Y and 50Y HARD-EXCLUDED — illiquid, mostly interpolated.
+        Observed 40Y dir_acc=0.9% (anti-signal) and 50Y=86.9% (artifact).
+    2b. XGBoost training cutoff 2015-01-01 — removes 1998-2014 rising-rate
+        regime that conflicted with 2015+ falling-rate regime and pushed
+        short-end dir_acc below 50% (anti-prediction).
 
   v3.5 fixes vs v3.4  (13 correctness + disclosure fixes):
     1. load_data auto-detects percent vs decimal (was a hard assertion crash)
@@ -93,7 +107,7 @@ except ImportError:
     pass
 
 print("=" * 72)
-print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5")
+print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.1")
 models_str = "VAR/VECM + NSS + Hull-White + XGBoost"
 if LSTM_AVAILABLE:
     models_str += " + Bi-LSTM"
@@ -143,6 +157,16 @@ def load_runtime_config():
 
 MIN_MAT_COVERAGE = 0.25   # min fraction of total history a maturity must cover
                           # (replaces absolute threshold — scales with dataset size)
+
+# v3.5.1 FIX 2b: XGBoost training cutoff.
+# The full Excel data goes back to 1998, but that covers three very
+# different rate regimes (1998-2003 high, 2004-2014 volatile, 2015-2026
+# low-and-falling). Training on all of it made the short-end model
+# LEARN contradictions — observed 3M dir_acc 39.9%, 6M 41.2%, 1Y 45.2%
+# (worse than coin flip = anti-prediction). Restricting training to
+# >= 2015 matches the actual Refinitiv daily-quote era and the regime
+# the production model is being asked to forecast.
+XGB_TRAIN_START = pd.Timestamp("2015-01-01")
 
 YIELD_COLS = {
     "3M":"IN3MT Yield (%)","6M":"IN6MT Yield (%)",
@@ -818,6 +842,14 @@ def build_econometric(df, horizon_days):
 # ============================================================================
 def build_xgboost(features, df, macro_weights, horizon):
     print(f"\n[7/12] Building XGBoost  (horizon = {horizon}d) ...")
+    # v3.5.1 FIX 2b: Training data cutoff disclosure
+    feat_start = features.index.min()
+    effective_start = max(feat_start, XGB_TRAIN_START)
+    if feat_start < XGB_TRAIN_START:
+        n_dropped = (features.index < XGB_TRAIN_START).sum()
+        print(f"    Train cutoff: {XGB_TRAIN_START:%Y-%m-%d}  "
+              f"(dropping {n_dropped:,} pre-cutoff rows from "
+              f"{feat_start:%Y-%m-%d})")
     models = {}
 
     for lab, col in YIELD_COLS.items():
@@ -826,6 +858,11 @@ def build_xgboost(features, df, macro_weights, horizon):
         X, y = features.loc[idx].copy(), target.loc[idx].copy()
         mask = np.isfinite(y) & np.all(np.isfinite(X.values), axis=1)
         X, y = X[mask], y[mask]
+        # v3.5.1 FIX 2b: restrict to the low-rate regime that matches the
+        # forecast environment. Applies per-maturity after NaN masking so
+        # row counts still gate properly.
+        X = X[X.index >= XGB_TRAIN_START]
+        y = y.loc[X.index]
         if len(X) < 800:
             continue
 
@@ -877,6 +914,23 @@ def build_lstm(features, df, horizon):
     if not LSTM_AVAILABLE:
         print("\n[8/12] LSTM -- skipped (TensorFlow not installed)")
         return None
+
+    # v3.5.1 FIX 1a: Reproducibility — seed EVERY random source before any
+    # TF op. Without this, two consecutive runs of the SAME script on the
+    # SAME data produce different LSTM weights -> different dir_acc ->
+    # different gating -> different ensemble -> different predictions.
+    # (Observed: 2Y flipped DOWN -10.9 bps <-> UP +3.7 bps across runs.)
+    import random as _py_random
+    _py_random.seed(42)
+    np.random.seed(42)
+    tf.random.set_seed(42)
+    os.environ["PYTHONHASHSEED"] = "42"
+    # Force single-thread determinism for GPU/CPU kernel selection
+    try:
+        tf.config.experimental.enable_op_determinism()
+    except Exception:
+        pass  # older TF versions lack this API
+
     # ACF-derived sequence length (data-driven, not hardcoded 60)
     ref_col = YIELD_COLS.get("10Y") or list(YIELD_COLS.values())[0]
     seq_len = _compute_seq_len(df[ref_col])
@@ -966,8 +1020,12 @@ def build_lstm(features, df, horizon):
             Dense(1)
         ])
         mdl.compile(optimizer=Adam(learning_rate=0.001), loss="huber")
+        # v3.5.1 FIX 1b: shuffle=False — Keras default shuffles training
+        # batches each epoch, which breaks the temporal order of a time
+        # series and adds run-to-run variance on top of the seed issue.
+        # For sequential data the order must be preserved.
         mdl.fit(Xtr_seq, ytr_seq, epochs=50, batch_size=64,
-                validation_split=0.10, verbose=0,
+                validation_split=0.10, verbose=0, shuffle=False,
                 callbacks=[EarlyStopping(patience=8, restore_best_weights=True),
                            ReduceLROnPlateau(factor=0.5, patience=4)])
 
@@ -984,17 +1042,17 @@ def build_lstm(features, df, horizon):
 
     # v3.5 FIX 8: LSTM coverage disclosure — which key maturities got fitted,
     # which got skipped (insufficient data / filtered), and how many gated
-    # out in the ensemble (dir_acc <= 0.50 -> anticorrelated).
+    # out in the ensemble (dir_acc <= 0.52 -> v3.5.1 raised threshold).
     fitted  = sorted(models.keys())
     want    = [m for m in key_mats if m in YIELD_COLS]
     skipped = [m for m in want if m not in fitted]
-    gated   = [m for m in fitted if models[m]["dir_acc"] <= 0.50]
+    gated   = [m for m in fitted if models[m]["dir_acc"] <= 0.52]
     print(f"\n    LSTM coverage:  fitted {len(fitted)}/{len(want)}  "
           f"({fitted})")
     if skipped:
         print(f"    Skipped (insufficient data): {skipped}")
     if gated:
-        print(f"    [!] Gated out of ensemble (dir_acc <= 50%): {gated}")
+        print(f"    [!] Gated out of ensemble (dir_acc <= 52%): {gated}")
 
     return models if models else None
 
@@ -1027,8 +1085,13 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
                             "dir": "UP" if mag > 0 else "DOWN",
                             "conf": conf, "rmse": xgb_m[lab]["rmse"]})
 
-        # --- LSTM (gated: exclude if dir_acc <= 0.50 — anticorrelated) ---
-        if has_lstm and lab in lstm_m and lstm_m[lab]["dir_acc"] > 0.50:
+        # --- LSTM (gated: exclude if dir_acc <= 0.52 — v3.5.1 FIX 1c) ---
+        # Raised from 0.50 to 0.52: a 50% boundary is too fragile. Two
+        # consecutive runs saw the SAME maturity flip from 49.8% -> 58.8%
+        # (3M) and 55.0% -> 41.6% (30Y), which cascaded to prediction
+        # reversals. 0.52 requires genuinely better-than-random skill
+        # and stabilises the ensemble under LSTM variance.
+        if has_lstm and lab in lstm_m and lstm_m[lab]["dir_acc"] > 0.52:
             m   = lstm_m[lab]
             raw = features[m["feats"]].iloc[-m["seq"]:].values
             xs  = m["sx"].transform(raw).reshape(1, m["seq"], -1)
@@ -1161,6 +1224,11 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
         X, y = features.loc[idx], target.loc[idx]
         mask = np.isfinite(y) & np.all(np.isfinite(X.values), axis=1)
         X, y = X[mask], y[mask]
+        # v3.5.1 FIX 2b: apply the same training cutoff to backtest so
+        # backtest accuracy reflects the production-time regime, not a
+        # 1998-era regime the live model will never see.
+        X = X[X.index >= XGB_TRAIN_START]
+        y = y.loc[X.index]
         if len(X) < 2000:
             continue
 
@@ -1432,13 +1500,28 @@ def main():
 
     df, mat_real_obs = load_data()
 
+    # v3.5.1 FIX 2a: HARD-EXCLUDE 40Y and 50Y unconditionally.
+    # Observed on 1998-2026 data: 40Y dir_acc=0.9% (statistically impossible
+    # by chance -> anti-signal) and 50Y dir_acc=86.9% (flagged as regime
+    # artifact). Both markets are illiquid with infrequent real trades;
+    # Refinitiv supplies interpolated quotes. Predictions on these tenors
+    # are meaningless and poison the ensemble / importance analysis.
+    HARD_EXCLUDE = ["40Y", "50Y"]
+    for lab in HARD_EXCLUDE:
+        if lab in YIELD_COLS:
+            YIELD_COLS.pop(lab, None)
+            MATURITIES_YRS.pop(lab, None)
+    DISPLAY_MATS[:] = [m for m in DISPLAY_MATS if m not in HARD_EXCLUDE]
+    print(f"    Hard-excluded illiquid ultra-long tenors: {HARD_EXCLUDE}")
+
     # v3.5 FIX 12: Relative coverage filter (replaces absolute MIN_MAT_OBS).
     # A maturity must have real observations covering >= MIN_MAT_COVERAGE
     # of the dataset. Dataset-size-invariant: 500 real obs of a 2000-row
     # dataset now fails (25%=500), but of a 6000-row dataset it'd need 1500.
     total_rows = len(df)
     min_obs_needed = max(200, int(total_rows * MIN_MAT_COVERAGE))
-    sparse = [lab for lab, n in mat_real_obs.items() if n < min_obs_needed]
+    sparse = [lab for lab, n in mat_real_obs.items()
+              if lab in YIELD_COLS and n < min_obs_needed]
     if sparse:
         for lab in sparse:
             YIELD_COLS.pop(lab, None)
@@ -1503,7 +1586,7 @@ def main():
 
     # ===== FINAL SUMMARY =====
     print("\n" + "=" * 82)
-    print("  PREDICTION SUMMARY  (v3.5)")
+    print("  PREDICTION SUMMARY  (v3.5.1)")
     print("=" * 82)
     print(f"  Horizon: {hlabel} ({hdays} trading days)\n")
     print(f"  {'Mat':>6s} {'Current':>8s} {'Dir':>7s} {'Chg(bps)':>9s} "
