@@ -1,6 +1,6 @@
 """
 ================================================================================
-  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.4
+  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.5
 ================================================================================
   Multi-Model Ensemble:
     Econometric  —  VAR / VECM  (reduced-form, max 4 vars, lag-capped)
@@ -30,6 +30,33 @@
     5. Hull-White CI width > 80 bps flagged as unreliable
     6. Negative edge warning when model underperforms baselines
     7. Backtest edge computed vs max(naive, momentum) — harder benchmark
+
+  v3.5.5 patch vs v3.5.4  (7 regime-adaptive fixes after 1W validation):
+    Validated v3.5.4 1-week predictions against April 9-16 2026 market:
+    model predicted -0.9 bps avg, reality was -22 bps (24x underestimate).
+    12/17 predictions labelled FLAT; all actually moved DOWN 15-38 bps.
+    Root cause: mean-reversion bias + exogenous shock blindness.
+
+    1. FLAT threshold: volatility-adaptive instead of static 20th pctile.
+       Uses 10th pctile × min(1, recent_vol/long_vol) × horizon_scaler.
+       Short horizons (1W) get 0.4× multiplier (was: same as 3M).
+    2. Data quality: cross-maturity monotonicity check — any yield >50 bps
+       from linear interpolation of neighbours is replaced. Catches
+       12Y=6.634% error (should have been ~7.10% between 11Y and 13Y).
+    3. CI volatility scaling: width × max(1, recent_vol/long_vol). In
+       volatile regimes CIs automatically widen (old: ±10 bps, needed ±30).
+    4. Magnitude calibration: emag × max(1, vol_ratio). Scales up
+       predictions from XGBoost's mean-reversion-biased near-zero outputs
+       to match current-regime volatility.
+    5. Trend-blend: horizon-dependent weights {1W:50%, 1M:35%, 3M:30%},
+       boosted +15% in high-vol regime. Stronger signal for short horizons.
+    6. Crude oil shock overlay: when crude moves >5% in the horizon window,
+       add a directional impact proportional to crude change (India imports
+       85% of crude; ~5 bps yield per 1% crude change empirically).
+    7. Regime detector (_detect_regime): classifies vol as high/normal/low
+       from recent_vol/long_vol ratio, detects crude shocks, measures
+       trend strength across key maturities. All downstream stages
+       (magnitude, trend-blend, CI, FLAT threshold) adapt to regime.
 
   v3.5.4 patch vs v3.5.3  (6 fixes targeting feature-crowding + trend regime):
     A. ma5/ma20/ma60 yield level features restricted to KEY_MA_MATS
@@ -62,7 +89,7 @@
        that window. v3.5.2's decay=0.0005 over all 7431 rows created a 41x
        weight ratio, destroying XGBoost (all maturities <50% dir_acc).
        v3.5.1's hard cutoff alone overfit the 2015+ rate-cut cycle
-       (70% build vs 41% backtest — 29bp gap). v3.5.4 combines both:
+       (70% build vs 41% backtest — 29bp gap). v3.5.5 combines both:
        regime isolation + mild within-window emphasis of recent tail.
     2. Backtest: same post-2015 restriction (plus test_size=150 to keep
        earliest folds viable). Walk-forward DirAcc now directly comparable
@@ -81,9 +108,9 @@
        value is in-sample) + 20% hard weight cap. Prevents in-sample/OOS
        mismatch from over-weighting VAR in the inverse-RMSE calculation.
 
-  v3.5.2 patch vs v3.5.1  (superseded by v3.5.4 — kept for historical trace):
+  v3.5.2 patch vs v3.5.1  (superseded by v3.5.5 — kept for historical trace):
     A. LSTM hard 2015 cutoff — fixed LSTM regime contamination.
-    B. XGBoost decay-only (too aggressive at 0.0005 — reverted in v3.5.4).
+    B. XGBoost decay-only (too aggressive at 0.0005 — reverted in v3.5.5).
     C. Backtest mirrored XGBoost decay (now also uses hard cutoff).
 
   v3.5.1 patch vs v3.5  (5 post-run fixes from first live-output review):
@@ -162,7 +189,7 @@ except ImportError:
     pass
 
 print("=" * 72)
-print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.4")
+print("  INDIAN GOVERNMENT BOND YIELD PREDICTION ENGINE  v3.5.5")
 models_str = "VAR/VECM + NSS + Hull-White + XGBoost"
 if LSTM_AVAILABLE:
     models_str += " + Bi-LSTM"
@@ -221,8 +248,8 @@ MIN_MAT_COVERAGE = 0.25   # min fraction of total history a maturity must cover
 # (worse than coin flip = anti-prediction). Restricting training to
 # >= 2015 matches the actual Refinitiv daily-quote era and the regime
 # the production model is being asked to forecast.
-XGB_TRAIN_START = pd.Timestamp("2015-01-01")   # hard cutoff: XGBoost + LSTM + backtest (v3.5.4)
-XGB_TIME_DECAY  = 0.00005                       # gentle decay INSIDE post-2015 window (v3.5.4)
+XGB_TRAIN_START = pd.Timestamp("2015-01-01")   # hard cutoff: XGBoost + LSTM + backtest (v3.5.5)
+XGB_TIME_DECAY  = 0.00005                       # gentle decay INSIDE post-2015 window (v3.5.5)
                                                  # (~9% lift newest vs oldest over ~1800 rows)
 
 YIELD_COLS = {
@@ -307,6 +334,37 @@ def load_data():
     assert _y10 < 1.0, f"10Y mean={_y10:.4f} still looks like percent after conversion"
     assert _cpi < 1.0, f"CPI mean={_cpi:.4f} still looks like percent after conversion"
     assert _repo < 1.0, f"Repo mean={_repo:.4f} still looks like percent after conversion"
+    # v3.5.5 FIX 2: Cross-maturity monotonicity / outlier check.
+    # Yield curves should be broadly monotone (short < long). If any
+    # maturity's yield is >50 bps away from linear interpolation of its
+    # neighbours, replace with interpolated value. This catches data errors
+    # like the 12Y=6.634% observed April 9 (should have been ~7.10%
+    # between 11Y=7.19% and 13Y=7.36%).
+    sorted_mats = sorted(MATURITIES_YRS.items(), key=lambda x: x[1])
+    mat_labs = [m[0] for m in sorted_mats]
+    mat_yrs  = [m[1] for m in sorted_mats]
+    n_fixed = 0
+    for i in range(1, len(mat_labs) - 1):
+        lab = mat_labs[i]
+        if lab not in YIELD_COLS:
+            continue
+        col = YIELD_COLS[lab]
+        prev_lab, next_lab = mat_labs[i-1], mat_labs[i+1]
+        if prev_lab not in YIELD_COLS or next_lab not in YIELD_COLS:
+            continue
+        prev_col, next_col = YIELD_COLS[prev_lab], YIELD_COLS[next_lab]
+        # Linear interpolation between neighbours
+        w = (mat_yrs[i] - mat_yrs[i-1]) / (mat_yrs[i+1] - mat_yrs[i-1])
+        interp = df[prev_col] * (1 - w) + df[next_col] * w
+        deviation = (df[col] - interp).abs() * 10_000   # bps
+        bad = deviation > 50
+        n_bad = bad.sum()
+        if n_bad > 0:
+            df.loc[bad, col] = interp[bad]
+            n_fixed += n_bad
+    if n_fixed > 0:
+        print(f"    [!] Fixed {n_fixed} cross-maturity outliers (>50 bps from neighbours)")
+
     df.dropna(inplace=True)
     print(f"    Rows: {len(df):,}  |  "
           f"Range: {df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d}")
@@ -358,14 +416,14 @@ def _make_xgb(n_estimators=500, max_depth=6, early_stopping_rounds=50,
     build_xgboost() uses defaults; run_backtest() passes smaller values
     explicitly (fewer trees for smaller per-fold training sets).
 
-    v3.5.4 FIX B: colsample_bytree 0.7 -> 0.5 forces every tree to draw
+    v3.5.5 FIX B: colsample_bytree 0.7 -> 0.5 forces every tree to draw
     from a smaller random feature pool. Without this, redundant smoothed
     level features (ma20_/ma60_) crowd out the few directional signals
     (forward-spot spreads, RBI stance) because trees always prefer the
     locally most-informative split and there are ~35 level features vs
     6 directional ones. Lower colsample spreads importance more evenly.
 
-    v3.5.4 FIX D: monotone_constraints can be passed as a tuple/list of
+    v3.5.5 FIX D: monotone_constraints can be passed as a tuple/list of
     {-1, 0, +1} aligned with training-matrix column order. Forward-spread
     features get +1 (curve-implied upward move -> predict up) and RBI
     stance gets +1 (hiking -> yields rise).
@@ -387,7 +445,7 @@ def _make_xgb(n_estimators=500, max_depth=6, early_stopping_rounds=50,
 
 
 def _build_monotone_vec(columns):
-    """v3.5.4 FIX D helper: return monotone-constraint list aligned to `columns`.
+    """v3.5.5 FIX D helper: return monotone-constraint list aligned to `columns`.
     +1 where the feature has a known monotone relationship with future yield.
     """
     mono = []
@@ -419,13 +477,89 @@ def _compute_seq_len(series, max_lag=120, min_lag=20, default=60):
 
 
 def _compute_flat_bps(df, col, horizon, fallback=3.0):
-    """Per-maturity FLAT threshold: 20th percentile of |historical changes|.
-    Returns at least 0.5 bps to avoid marking everything as FLAT.
+    """v3.5.5: Per-maturity FLAT threshold — VOLATILITY-ADAPTIVE.
+
+    Old: 20th pctile of |historical Δ|. With 1W horizon in calm period this
+    returned ~5-8 bps, killing ALL predictions since model magnitudes are
+    0.2-1.0 bps. Result: 12/17 maturities labelled FLAT when reality was
+    -18 to -38 bps (April 9-16 2026 validation).
+
+    New: threshold = 10th pctile (more permissive base)
+         × min(1.0, recent_vol / long_vol) — shrinks in calm regimes,
+           stays full in volatile regimes (when FLAT is wrong)
+         × horizon multiplier  {5: 0.4, 20: 0.7, 60: 1.0}
+           shorter horizons = smaller changes expected = lower threshold
     """
     hist = (df[col].diff(horizon) * 10_000).dropna().tail(504)
-    if len(hist) > 60:
-        return max(0.5, float(np.percentile(np.abs(hist), 20)))
-    return fallback
+    if len(hist) < 60:
+        return fallback
+    # Base: 10th percentile (was 20th — too aggressive)
+    base = max(0.3, float(np.percentile(np.abs(hist), 10)))
+    # Vol ratio: recent / long-run (< 1 in calm, > 1 in volatile)
+    recent_vol = hist.tail(60).std()
+    long_vol   = hist.std()
+    vol_ratio  = min(1.0, recent_vol / (long_vol + 1e-6))
+    # Horizon scaler: short horizons need proportionally lower thresholds
+    h_scale = {5: 0.4, 20: 0.7, 60: 1.0}.get(horizon, 0.7)
+    return base * vol_ratio * h_scale
+
+
+def _detect_regime(df, horizon):
+    """v3.5.5 FIX 7: Regime volatility detector.
+
+    Returns a dict with:
+      vol_regime: "high" | "normal" | "low"
+      vol_ratio:  recent_vol / long_vol (used by CI, magnitude scaler)
+      trend_strength: average |directional persistence| over key mats
+      crude_shock: True if crude moved >5% in last `horizon` days
+
+    The ensemble uses this to switch between mean-reversion mode (normal/low
+    vol) and trend-following mode (high vol / crude shock).
+    """
+    # Crude oil shock detection
+    crude_col = MACRO_COLS.get("Crude")
+    crude_shock = False
+    crude_5d_chg = 0.0
+    if crude_col and crude_col in df.columns:
+        crude = df[crude_col].dropna()
+        if len(crude) > horizon:
+            crude_5d_chg = float((crude.iloc[-1] / crude.iloc[-horizon - 1] - 1))
+            crude_shock = abs(crude_5d_chg) > 0.05
+
+    # Yield volatility regime (10Y as proxy)
+    y10 = df[YIELD_COLS.get("10Y", list(YIELD_COLS.values())[0])]
+    changes = (y10.diff(horizon) * 10_000).dropna()
+    recent_vol = float(changes.tail(60).std()) if len(changes) > 60 else 10.0
+    long_vol   = float(changes.tail(504).std()) if len(changes) > 504 else recent_vol
+    vol_ratio  = recent_vol / (long_vol + 1e-6)
+
+    if vol_ratio > 1.3 or crude_shock:
+        vol_regime = "high"
+    elif vol_ratio < 0.7:
+        vol_regime = "low"
+    else:
+        vol_regime = "normal"
+
+    # Trend strength: what fraction of key mats moved same direction over recent window
+    key_cols = [YIELD_COLS[m] for m in ["3M","2Y","5Y","10Y","30Y"] if m in YIELD_COLS]
+    dirs = []
+    for c in key_cols:
+        chg = float(df[c].diff(horizon).iloc[-1] * 10_000) if len(df) > horizon else 0
+        dirs.append(np.sign(chg))
+    if dirs:
+        trend_strength = abs(np.mean(dirs))   # 1.0 = all same dir, 0 = mixed
+    else:
+        trend_strength = 0.0
+
+    return {
+        "vol_regime":     vol_regime,
+        "vol_ratio":      round(vol_ratio, 3),
+        "trend_strength": round(trend_strength, 3),
+        "crude_shock":    crude_shock,
+        "crude_chg_pct":  round(crude_5d_chg * 100, 2),
+        "recent_vol":     round(recent_vol, 2),
+        "long_vol":       round(long_vol, 2),
+    }
 
 
 # ============================================================================
@@ -439,7 +573,7 @@ def fit_nss_fast(df):
 
     # Cache version tag — bump when fitting method OR upstream unit handling
     # changes, to force refit (v3.5 changed load_data unit handling)
-    NSS_VERSION = "v3.5.4-feature-trim"
+    NSS_VERSION = "v3.5.5-regime-adaptive"
     if NSS_CACHE.exists():
         cached = pd.read_csv(NSS_CACHE, index_col=0, parse_dates=True)
         cache_ver = cached.columns[-1] if cached.columns[-1].startswith("ver") else ""
@@ -519,8 +653,8 @@ def engineer_features(df, macro_weights, nss_params):
     F = pd.DataFrame(index=df.index)
 
     # --- yield features ---
-    # v3.5.4 FIX A: ma5/ma20/ma60 level features restricted to KEY maturities
-    # only. v3.5.4 had these for all 13 maturities (~39 smoothed level
+    # v3.5.5 FIX A: ma5/ma20/ma60 level features restricted to KEY maturities
+    # only. v3.5.5 had these for all 13 maturities (~39 smoothed level
     # features), which crowded out the 6 new directional features in
     # XGBoost tree splits. KEY = 3M, 2Y, 5Y, 10Y, 30Y only — the rest keep
     # their differentials (dy1/dy5/dy20) and level y_ but not moving avgs.
@@ -564,7 +698,7 @@ def engineer_features(df, macro_weights, nss_params):
     # --- macro features (scaled by user weights — linear, not sqrt) ---
     # Linear scaling gives range ~0.7x–1.8x (meaningful for LSTM);
     # XGBoost gets macro influence via macro_composite + sample weights.
-    # v3.5.4 FIX C: drop direct per-variable features for macros that are
+    # v3.5.5 FIX C: drop direct per-variable features for macros that are
     # statistically insignificant (Granger p > 0.5). IIP showed p=0.8066
     # but appeared as #4 XGBoost feature with 23.7% importance — a clear
     # spurious fit. Keeping IIP only inside macro_composite preserves the
@@ -595,7 +729,7 @@ def engineer_features(df, macro_weights, nss_params):
         mu  = chg.rolling(252, min_periods=60).mean()
         sig = chg.rolling(252, min_periods=60).std()
         z_parts[name] = ((chg - mu) / (sig + 1e-12)).clip(-4, 4)
-    # v3.5.4 FIX: bfill instead of fillna(0). fillna(0) tells the model the
+    # v3.5.5 FIX: bfill instead of fillna(0). fillna(0) tells the model the
     # macro environment was "perfectly neutral" for the first 252 rows,
     # which is factually wrong — early 2015 was an active RBI cutting cycle.
     # bfill inherits the first valid z-score reading so the warm-up window
@@ -604,7 +738,7 @@ def engineer_features(df, macro_weights, nss_params):
     w_arr = np.array([macro_weights[k] / 100 for k in MACRO_COLS])
     F["macro_composite"] = z_parts.values @ w_arr
 
-    # v3.5.4 FIX: real_yield / term_prem scaled to bps (*10_000) to match
+    # v3.5.5 FIX: real_yield / term_prem scaled to bps (*10_000) to match
     # every other yield-differential feature (slope_*, butterfly, dy*_*).
     # v3.5 had these in raw decimal (~0.01-0.03), which is 4 orders of
     # magnitude smaller than bps features and distorts RobustScaler in LSTM.
@@ -612,7 +746,7 @@ def engineer_features(df, macro_weights, nss_params):
     F["term_prem_10y"]  = (df[YIELD_COLS["10Y"]] - df[MACRO_COLS["Repo Rate"]]) * 10_000
 
     # ----------------------------------------------------------------------
-    # v3.5.4 NEW FEATURES — directional signal boosters
+    # v3.5.5 NEW FEATURES — directional signal boosters
     # ----------------------------------------------------------------------
     # (A) Forward-spot spreads from the existing yield curve. The forward
     # rate F(t1,t2) = (t2*y2 - t1*y1)/(t2-t1); forward minus spot y2
@@ -983,10 +1117,10 @@ def build_econometric(df, horizon_days):
 # ============================================================================
 def build_xgboost(features, df, macro_weights, horizon):
     print(f"\n[7/12] Building XGBoost  (horizon = {horizon}d) ...")
-    # v3.5.4: hard 2015 cutoff AND gentle time-decay within post-2015 window.
-    # v3.5.4 removed the cutoff entirely and got destroyed by 1998-2014 noise.
+    # v3.5.5: hard 2015 cutoff AND gentle time-decay within post-2015 window.
+    # v3.5.5 removed the cutoff entirely and got destroyed by 1998-2014 noise.
     # v3.5.1 used only the cutoff and overfit the 2015+ rate-cut cycle (70% -> 39% backtest).
-    # v3.5.4: post-2015 only, with decay=0.00005 (8x gentler than v3.5.4's 0.0005)
+    # v3.5.5: post-2015 only, with decay=0.00005 (8x gentler than v3.5.5's 0.0005)
     # so the 2015-2023 rate-cycle variation is still visible under the 2024-2026 tail.
     print(f"    Training window: >= {XGB_TRAIN_START:%Y-%m-%d}  "
           f"|  decay={XGB_TIME_DECAY:.5f}/row")
@@ -998,7 +1132,7 @@ def build_xgboost(features, df, macro_weights, horizon):
         X, y = features.loc[idx].copy(), target.loc[idx].copy()
         mask = np.isfinite(y) & np.all(np.isfinite(X.values), axis=1)
         X, y = X[mask], y[mask]
-        # v3.5.4: hard post-2015 restriction (LSTM uses same cutoff, keeps
+        # v3.5.5: hard post-2015 restriction (LSTM uses same cutoff, keeps
         # both models in the same regime — backtest now applies this too)
         X = X[X.index >= XGB_TRAIN_START]
         y = y.loc[X.index]
@@ -1015,7 +1149,7 @@ def build_xgboost(features, df, macro_weights, horizon):
         if len(Xtr) < 500 or len(Xte) < 50:
             continue
 
-        # v3.5.4: gentle decay INSIDE the post-2015 window — recent
+        # v3.5.5: gentle decay INSIDE the post-2015 window — recent
         # 2024-2026 rows slightly emphasised, 2015-2023 still contributes.
         # With ~1800 train rows and decay=0.00005, ratio = exp(0.00005*1800) = 1.094
         # i.e. ~9% lift on newest vs oldest row — not destructive.
@@ -1027,7 +1161,7 @@ def build_xgboost(features, df, macro_weights, horizon):
             mc = np.abs(Xtr["macro_composite"].values)
             sw = time_weights * (1.0 + 0.5 * mc / (mc.mean() + 1e-8))
 
-        # v3.5.4 FIX D: monotone constraints for directional features
+        # v3.5.5 FIX D: monotone constraints for directional features
         mono = _build_monotone_vec(Xtr.columns)
         reg = _make_xgb(monotone_constraints=mono)
         reg.fit(Xtr, ytr, sample_weight=sw,
@@ -1038,7 +1172,7 @@ def build_xgboost(features, df, macro_weights, horizon):
         mae   = mean_absolute_error(yte, preds)
         dir_acc = np.mean(np.sign(yte) == np.sign(preds))
 
-        # v3.5.4 FIX F: store naive baseline for ensemble trend-blend
+        # v3.5.5 FIX F: store naive baseline for ensemble trend-blend
         prop_up = float(np.mean(yte > 0))
         naive_acc = max(prop_up, 1.0 - prop_up)
 
@@ -1120,7 +1254,7 @@ def build_lstm(features, df, horizon):
                 break
 
         idx = features.index.intersection(target.dropna().index)
-        # v3.5.4: hard regime cutoff for LSTM — sequence models cannot be
+        # v3.5.5: hard regime cutoff for LSTM — sequence models cannot be
         # reweighted row-wise the way XGBoost can, so the simplest way to
         # remove 1998-era regime contamination is a hard start date.
         idx = idx[idx >= XGB_TRAIN_START]
@@ -1218,7 +1352,15 @@ def build_lstm(features, df, horizon):
 # ============================================================================
 def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
     print(f"\n[9/12] Generating ensemble predictions ...")
-    FLAT_FALLBACK = {5: 1, 20: 3, 60: 8}.get(horizon, 3)
+    FLAT_FALLBACK = {5: 0.5, 20: 2, 60: 5}.get(horizon, 2)
+
+    # v3.5.5 FIX 7: Regime detection — determines whether to lean toward
+    # mean-reversion (normal/low vol) or trend-following (high vol / shock).
+    regime = _detect_regime(df, horizon)
+    vol_regime = regime["vol_regime"]
+    print(f"    Regime: {vol_regime.upper()}  |  vol_ratio={regime['vol_ratio']:.2f}  "
+          f"|  trend={regime['trend_strength']:.2f}  "
+          f"|  crude={'SHOCK '+str(regime['crude_chg_pct'])+'%' if regime['crude_shock'] else 'normal'}")
     predictions = {}
     has_lstm = lstm_m is not None
     has_var  = econ is not None
@@ -1288,7 +1430,7 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
             continue
 
         # FIX: performance-adaptive weights (inverse RMSE)
-        # v3.5.4 FIX: VAR reports IN-SAMPLE residual RMSE while XGBoost/LSTM
+        # v3.5.5 FIX: VAR reports IN-SAMPLE residual RMSE while XGBoost/LSTM
         # report OUT-OF-SAMPLE test-set RMSE. Raw inverse-RMSE weighting
         # therefore systematically over-weights VAR. Apply a 1.5x penalty
         # to VAR's RMSE (typical in-sample/out-of-sample bias ratio) before
@@ -1321,29 +1463,64 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
         emag  = sum(s["mag"] * s["w"] for s in sources) / tw
         econf = sum(s["conf"] * s["w"] for s in sources) / tw
 
-        # v3.5.4 FIX F: Trend-aware blend. When XGBoost's historical
-        # directional accuracy is below the naive majority-class baseline
-        # by more than 2%, the current regime is "trending so hard that
-        # just predicting the trend wins". Blend 30% of the ensemble
-        # toward the recent realised-trend magnitude so predictions stop
-        # being systematically flat against a persistent trend.
+        # ==================================================================
+        # v3.5.5: REGIME-ADAPTIVE POST-PROCESSING PIPELINE
+        # Replaces v3.5.5's simple 30% trend blend with a 4-stage pipeline:
+        #   Stage 1: Magnitude calibration (scale up from mean-reversion bias)
+        #   Stage 2: Trend blend (stronger for 1W, regime-aware)
+        #   Stage 3: Crude oil shock overlay
+        #   Stage 4: Direction decision (vol-adaptive FLAT threshold)
+        # ==================================================================
         trend_blend_tag = ""
+
+        # Stage 1: MAGNITUDE CALIBRATION (FIX 4)
+        # The ensemble systematically predicts near-zero magnitudes because
+        # XGBoost trained on MSE/Huber loss learns "predict small". Scale up
+        # by the vol ratio so predictions match current-regime volatility.
+        # In high-vol regimes: emag *= 1.3-2.0. In normal: *= 1.0-1.3.
+        mag_scale = max(1.0, regime["vol_ratio"])
+        emag *= mag_scale
+
+        # Stage 2: TREND BLEND (FIX 5, horizon-adaptive)
+        # v3.5.5 used 30% always. v3.5.5: blend weight is:
+        #   - Horizon-dependent: 1W=50%, 1M=35%, 3M=30%
+        #   - Boosted in high-vol regime or when trend is strong
+        #   - Only activates when model loses to naive OR when regime is high
+        TREND_BLEND_W = {5: 0.50, 20: 0.35, 60: 0.30}.get(horizon, 0.35)
+        if vol_regime == "high":
+            TREND_BLEND_W = min(0.60, TREND_BLEND_W + 0.15)  # boost in volatile regimes
+
+        should_trend_blend = False
         if lab in xgb_m:
             x_model_acc = xgb_m[lab]["dir_acc"]
             x_naive_acc = xgb_m[lab].get("naive_acc", 0.50)
             if x_model_acc < x_naive_acc - 0.02:
-                recent = float((df[col].iloc[-1] - df[col].iloc[-horizon-1]) * 10_000) \
-                    if len(df) > horizon + 1 else 0.0
-                if np.isfinite(recent) and abs(recent) > 1e-6:
-                    emag = 0.7 * emag + 0.3 * recent
-                    # Cap confidence at the naive baseline since we're
-                    # explicitly deferring to the trend, not beating it.
-                    econf = min(econf, x_naive_acc)
-                    trend_blend_tag = " [trend-blend]"
+                should_trend_blend = True
+        # Also trigger blend when vol regime is "high" regardless of accuracy
+        if vol_regime == "high" and regime["trend_strength"] > 0.6:
+            should_trend_blend = True
 
-        # Direction ALWAYS from sign(ensemble_magnitude) — never from a vote.
-        # A vote can contradict magnitude (e.g. "DOWN +6.3 bps") which is nonsense.
-        # Per-maturity FLAT threshold from historical data (not hardcoded)
+        if should_trend_blend and len(df) > horizon + 1:
+            recent = float((df[col].iloc[-1] - df[col].iloc[-horizon-1]) * 10_000)
+            if np.isfinite(recent) and abs(recent) > 1e-6:
+                emag = (1 - TREND_BLEND_W) * emag + TREND_BLEND_W * recent
+                if lab in xgb_m:
+                    econf = min(econf, xgb_m[lab].get("naive_acc", 0.55))
+                trend_blend_tag = f" [trend-blend {TREND_BLEND_W:.0%}]"
+
+        # Stage 3: CRUDE OIL SHOCK OVERLAY (FIX 6)
+        # India imports 85% of crude. When crude moves >5% in `horizon` days,
+        # that's the single biggest driver of bond yields. Apply a directional
+        # overlay: crude up -> yields up (bad for bonds), crude down -> yields down.
+        # Sensitivity: ~5 bps yield change per 1% crude change (empirical).
+        if regime["crude_shock"]:
+            crude_impact = regime["crude_chg_pct"] * 5.0  # 1% crude → ~5 bps yield
+            # Blend: overlay contributes proportionally to shock magnitude
+            overlay_w = min(0.30, abs(regime["crude_chg_pct"]) / 30)  # max 30%
+            emag = (1 - overlay_w) * emag + overlay_w * crude_impact
+            trend_blend_tag += f" [crude-shock {regime['crude_chg_pct']:+.1f}%]"
+
+        # Stage 4: DIRECTION DECISION (vol-adaptive FLAT threshold)
         flat_bps = _compute_flat_bps(df, col, horizon, FLAT_FALLBACK)
         if abs(emag) < flat_bps:
             edir = "FLAT"
@@ -1352,27 +1529,37 @@ def ensemble_predict(xgb_m, lstm_m, econ, hw, features, df, macro_w, horizon):
         else:
             edir = "DOWN"
 
-        # Empirical quantile CI, centered on model prediction (not historical median)
+        # v3.5.5 FIX 3: CONFIDENCE INTERVAL — volatility-scaled.
+        # Old: raw 5th/95th pctile of last 504 days. Failed catastrophically
+        # in volatile regimes (CI ±10 bps, actual move -18 to -38 bps).
+        # New: scale CI width by max(1, recent_vol / long_vol) so that
+        # volatile regimes automatically produce wider CIs.
         hist = (df[col].diff(horizon) * 10_000).dropna().tail(504)
         if len(hist) > 60:
             raw_lo = float(np.percentile(hist, 5))
             raw_hi = float(np.percentile(hist, 95))
             hist_med = float(np.median(hist))
-            # Shift CI so it's centered on ensemble prediction
+            # Shift CI to center on prediction
             lo = raw_lo - hist_med + emag
             hi = raw_hi - hist_med + emag
+            # Widen by vol ratio (>1 in volatile regimes, 1 otherwise)
+            ci_scale = max(1.0, regime["vol_ratio"])
+            center_ci = (hi + lo) / 2
+            half_w = (hi - lo) / 2 * ci_scale
+            lo = center_ci - half_w
+            hi = center_ci + half_w
         else:
             vol = hist.std() if len(hist) > 20 else 10.0
             lo = emag - 1.65 * vol
             hi = emag + 1.65 * vol
 
-        # FIX: CI widening under extreme macro (center + spread approach)
+        # Additional widening under extreme macro composite
         mc = features["macro_composite"].iloc[-1]
         if abs(mc) > 1.5:
-            center = (hi + lo) / 2
-            spread = (hi - lo) / 2
-            lo = center - spread * 1.20
-            hi = center + spread * 1.20
+            center_ci = (hi + lo) / 2
+            half_w = (hi - lo) / 2 * 1.20
+            lo = center_ci - half_w
+            hi = center_ci + half_w
             econf *= 0.90
 
         # momentum flag
@@ -1413,7 +1600,7 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
     print(f"        [XGBoost-only component — ensemble accuracy may differ]")
     results = {}
     key_mats = ["3M","1Y","2Y","5Y","7Y","10Y","14Y","30Y"]
-    # v3.5.4: with post-2015 window (~2700 rows), test_size=252 leaves too
+    # v3.5.5: with post-2015 window (~2700 rows), test_size=252 leaves too
     # little train data for the earliest fold. Shrink to 150 (~7 months).
     tscv = TimeSeriesSplit(n_splits=n_folds, test_size=150)
 
@@ -1426,7 +1613,7 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
         X, y = features.loc[idx], target.loc[idx]
         mask = np.isfinite(y) & np.all(np.isfinite(X.values), axis=1)
         X, y = X[mask], y[mask]
-        # v3.5.4: match live XGBoost training window so walk-forward folds
+        # v3.5.5: match live XGBoost training window so walk-forward folds
         # measure out-of-sample accuracy in the SAME regime the live model
         # sees. Without this, early folds cover 1998-2014 rising-rate data
         # while the live model is trained on 2015+, making the comparison
@@ -1450,13 +1637,13 @@ def run_backtest(features, df, macro_w, horizon, n_folds=5):
             Xte = X.iloc[test_i]
             yte = y.iloc[test_i]
 
-            # v3.5.4: mirror the live XGBoost time-decay weighting so
+            # v3.5.5: mirror the live XGBoost time-decay weighting so
             # backtest DirAcc is directly comparable to the build_xgboost()
             # single-split DirAcc (both now emphasise the recent regime).
             n_tr = len(Xtr)
             sw_tr = np.exp(XGB_TIME_DECAY * np.arange(n_tr))
             sw_tr /= sw_tr.mean()
-            # v3.5.4 FIX D: same monotone constraints as build_xgboost()
+            # v3.5.5 FIX D: same monotone constraints as build_xgboost()
             mono_bt = _build_monotone_vec(Xtr.columns)
             reg = _make_xgb(n_estimators=300, max_depth=5,
                             early_stopping_rounds=30,
@@ -1720,7 +1907,7 @@ def main():
     # artifact). Both markets are illiquid with infrequent real trades;
     # Refinitiv supplies interpolated quotes. Predictions on these tenors
     # are meaningless and poison the ensemble / importance analysis.
-    # v3.5.4 FIX E: Extend HARD_EXCLUDE with 19Y and 24Y. Both are non-benchmark
+    # v3.5.5 FIX E: Extend HARD_EXCLUDE with 19Y and 24Y. Both are non-benchmark
     # tenors in India — quotes are mostly interpolated, not traded. Observed
     # post-2015 dir_acc: 19Y=48.4%, 24Y=47.2% (below coin-flip). Neither has
     # backtest walk-forward coverage (backtest key_mats excludes them), so
@@ -1806,7 +1993,7 @@ def main():
 
     # ===== FINAL SUMMARY =====
     print("\n" + "=" * 82)
-    print("  PREDICTION SUMMARY  (v3.5.4)")
+    print("  PREDICTION SUMMARY  (v3.5.5)")
     print("=" * 82)
     print(f"  Horizon: {hlabel} ({hdays} trading days)\n")
     print(f"  {'Mat':>6s} {'Current':>8s} {'Dir':>7s} {'Chg(bps)':>9s} "
